@@ -249,6 +249,10 @@ namespace CS2MultiplayerMod.Core.Session
                 case MessageType.DisconnectNotice:
                     HandleDisconnectNotice(connection, peer, (DisconnectNoticeMessage)message);
                     break;
+                case MessageType.CommandReplayRequest:
+                    HandleCommandReplayRequest(connection, peer,
+                        (CommandReplayRequestMessage)message);
+                    break;
             }
         }
 

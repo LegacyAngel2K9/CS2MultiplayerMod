@@ -196,7 +196,7 @@ namespace CS2MultiplayerMod.Core.Protocol
         /// islands) reattach on the receiver.
         /// See <see cref="Messages.HandshakeRequest"/> and version notes in doc/internals.
         /// </summary>
-        public const int ProtocolVersion = 61;
+        public const int ProtocolVersion = 62;
 
         /// <summary>
         /// Hard cap on a single payload, guarding against corrupt length prefixes.

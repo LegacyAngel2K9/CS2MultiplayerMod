@@ -38,6 +38,7 @@ namespace CS2MultiplayerMod.Core.Session
 
         private void StartHostCore(MultiplayerConfig config)
         {
+            ResetCommandSequenceState();
             if (config.Transport == TransportMode.SteamRelay)
             {
                 StartRelayHost(config);
@@ -148,6 +149,8 @@ namespace CS2MultiplayerMod.Core.Session
         public void Join(MultiplayerConfig config)
         {
             if (Role != SessionRole.None) throw new InvalidOperationException("A session is already active.");
+
+            ResetCommandSequenceState();
 
             // Same containment as StartHost: a throw after Role is set must become a
             // clean Fault (which resets the session), never a stuck half-join.
@@ -278,6 +281,8 @@ namespace CS2MultiplayerMod.Core.Session
                 try { _portForward.Dispose(); } catch { /* the router can expire it instead */ }
                 _portForward = null;
             }
+
+            ResetCommandSequenceState();
 
             _peers.Clear();
             _administrativeRemovals.Clear();

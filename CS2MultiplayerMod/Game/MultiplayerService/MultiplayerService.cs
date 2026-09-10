@@ -67,6 +67,7 @@ namespace CS2MultiplayerMod.Game
         private ushort _lastLoggedCommandId;
         private long _lastCommandLogMs;
         private long _lastCommandLoggedTotal;
+        private long _lastCommandSequence;
 
         public MultiplayerService(IModLogger log)
         {
@@ -134,6 +135,7 @@ namespace CS2MultiplayerMod.Game
             _appliedCommandTotal++;
             _lastAppliedCommandId = command.CommandId;
             _lastAppliedCommandOrigin = command.OriginPlayerId;
+            _lastCommandSequence = command.Sequence;
             _lastAppliedCommandBytes = command.Body != null ? command.Body.Length : 0;
             _lastAppliedCommandMs = now;
 
@@ -151,7 +153,7 @@ namespace CS2MultiplayerMod.Game
             _lastCommandLoggedTotal = _appliedCommandTotal;
             SyncLog.Trace(LogTopic.Session, "command-apply name=" + CommandName(command.CommandId) +
                 " id=" + command.CommandId + " origin=" + command.OriginPlayerId + " tick=" +
-                command.Tick + " bytes=" + _lastAppliedCommandBytes + " sinceLast=" +
+                command.Tick + " sequence=" + command.Sequence + " bytes=" + _lastAppliedCommandBytes + " sinceLast=" +
                 commandsSinceLog + " total=" + _appliedCommandTotal);
         }
 
@@ -165,6 +167,7 @@ namespace CS2MultiplayerMod.Game
             _lastLoggedCommandId = 0;
             _lastCommandLogMs = 0;
             _lastCommandLoggedTotal = 0;
+            _lastCommandSequence = 0;
         }
 
         private static string CommandName(ushort id)

@@ -210,10 +210,12 @@ namespace CS2MultiplayerMod.Core.Session
         {
             if (Status != SessionStatus.Connected || _worldSyncSuspended) return;
 
-            var message = new SimulationCommandMessage(LocalPlayerId, tick, commandId, body);
+            var message = new SimulationCommandMessage(LocalPlayerId, tick,
+                NextCommandSequence(), commandId, body);
             if (Role == SessionRole.Host)
             {
                 NotifyCommand(message);                    // apply on the host
+                JournalCommand(message);
                 BroadcastToAll(message, ConnectionId.None); // and to clients
             }
             else
@@ -242,9 +244,53 @@ namespace CS2MultiplayerMod.Core.Session
             if (Role == SessionRole.Host && peer != null)
                 command.OriginPlayerId = peer.PlayerId;
 
+            // The host is the single ordering authority. Commands from clients arrive on
+            // separate sockets and therefore cannot safely use arrival order on receivers.
+            // Stamp before notifying the host or relaying so every remote peer sees the same
+            // canonical order. A non-zero sequence from an untrusted client is overwritten.
+            if (Role == SessionRole.Host)
+                command.Sequence = NextCommandSequence();
+
+            if (Role == SessionRole.Client && command.Sequence > 0)
+            {
+                // Commands normally arrive in host order. A gap means one or more TCP/relay
+                // messages were lost or delayed at the session layer; ask for the small missing
+                // range instead of immediately replacing the whole world.
+                if (_lastReceivedCommandSequence > 0 &&
+                    command.Sequence > _lastReceivedCommandSequence + 1)
+                {
+                    SendTo(ConnectionId.Server, new CommandReplayRequestMessage(
+                        _lastReceivedCommandSequence + 1, command.Sequence - 1));
+                }
+
+                // Replayed commands may arrive after the live command that exposed the gap.
+                // Do not apply duplicates a second time.
+                if (command.Sequence <= _lastReceivedCommandSequence) return;
+                _lastReceivedCommandSequence = command.Sequence;
+            }
+
             NotifyCommand(command);
             if (Role == SessionRole.Host)
+            {
+                JournalCommand(command);
                 BroadcastToAll(command, from); // relay to the other clients
+            }
+        }
+
+        private void HandleCommandReplayRequest(ConnectionId from, Peer peer,
+            CommandReplayRequestMessage request)
+        {
+            if (Role != SessionRole.Host || peer == null || !peer.Handshaked) return;
+            if (request.FromSequence <= 0 || request.ToSequence < request.FromSequence ||
+                request.ToSequence - request.FromSequence > 256)
+            {
+                Punt(from, peer, "invalid command replay range", "CommandReplayRequest");
+                return;
+            }
+
+            foreach (SimulationCommandMessage command in ReplayCommands(
+                         request.FromSequence, request.ToSequence))
+                SendTo(from, command);
         }
 
         /// <summary>

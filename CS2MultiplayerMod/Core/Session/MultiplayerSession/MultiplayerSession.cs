@@ -61,6 +61,41 @@ namespace CS2MultiplayerMod.Core.Session
         private bool _awaitingHostApproval;
         private bool _worldSyncSuspended;
         private long _worldSyncEpoch;
+        // Host-assigned total order for gameplay commands. It is deliberately session-scoped:
+        // a world snapshot starts a new epoch and commands from the previous epoch are invalid.
+        private long _nextCommandSequence;
+        private const int CommandJournalCapacity = 4096;
+        private readonly LinkedList<SimulationCommandMessage> _commandJournal =
+            new LinkedList<SimulationCommandMessage>();
+        private long _lastReceivedCommandSequence;
+
+        private void ResetCommandSequenceState()
+        {
+            _nextCommandSequence = 0;
+            _lastReceivedCommandSequence = 0;
+            _commandJournal.Clear();
+        }
+
+        internal long NextCommandSequence()
+        {
+            if (Role != SessionRole.Host) return 0;
+            return ++_nextCommandSequence;
+        }
+
+        internal void JournalCommand(SimulationCommandMessage command)
+        {
+            if (Role != SessionRole.Host || command == null || command.Sequence <= 0) return;
+            _commandJournal.AddLast(command);
+            while (_commandJournal.Count > CommandJournalCapacity)
+                _commandJournal.RemoveFirst();
+        }
+
+        internal IEnumerable<SimulationCommandMessage> ReplayCommands(long from, long to)
+        {
+            foreach (SimulationCommandMessage command in _commandJournal)
+                if (command.Sequence >= from && command.Sequence <= to)
+                    yield return command;
+        }
 
         public MultiplayerSession(IModLogger log, MessageCodec codec = null)
         {

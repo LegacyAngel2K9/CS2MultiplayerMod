@@ -182,7 +182,21 @@ namespace CS2MultiplayerMod.Core.Networking.Tcp
         {
             FramedConnection removed;
             _connections.TryRemove(id.Value, out removed);
-            Interlocked.Increment(ref _queuedEvents);
+
+            // Disconnect notifications used to bypass the bounded queue check. A client
+            // repeatedly opening and closing connections could therefore grow the queue even
+            // when normal data events were protected by MaxQueuedEvents. Keep the notification
+            // (the session needs it to release peer state), but apply the same bound as every
+            // other transport event. There is no live connection left to close here.
+            if (Interlocked.Increment(ref _queuedEvents) > MaxQueuedEvents)
+            {
+                Interlocked.Decrement(ref _queuedEvents);
+                _log.Warn(LogTopic.Transport,
+                    "Transport event queue full; dropping disconnect notification for connection " +
+                    id.Value + ".");
+                return;
+            }
+
             _events.Enqueue(TransportEvent.Disconnected(id, reason));
         }
 

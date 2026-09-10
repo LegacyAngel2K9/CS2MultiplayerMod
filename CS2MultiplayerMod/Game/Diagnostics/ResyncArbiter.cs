@@ -123,9 +123,13 @@ namespace CS2MultiplayerMod.Game.Diagnostics
                     held.Report.Observations++;
                     observations = held.Report.Observations;
                     heldForMs = nowMs - held.Report.FirstSeenMs;
-                    // Seen again. A claim about the world is now corroborated. A claim about this
-                    // machine's own pipeline is not: failing again one frame later says nothing the
-                    // first failure did not, and the hold is what gives the retry a quiet world.
+                    // Seen again. A claim about the world is now corroborated. A claim about a
+                    // missing target is still ambiguous: command ordering, a delayed native
+                    // realization, or a dependency held by another pipeline stage can all make
+                    // the same target appear absent for several frames. Do not turn two adjacent
+                    // observations into a full world reload. The hold window is deliberately the
+                    // repair window; only an explicit contradiction or lost stream is conclusive
+                    // before it expires.
                     settle = SettlesOnRepeat(report.Evidence) || nowMs >= held.HoldUntilMs;
                     if (settle) Pending.Remove(key);
                 }
@@ -258,9 +262,13 @@ namespace CS2MultiplayerMod.Game.Diagnostics
         private static bool SettlesImmediately(ResyncEvidence evidence) =>
             evidence == ResyncEvidence.Contradiction || evidence == ResyncEvidence.StreamLoss;
 
-        /// <summary>A missing target seen twice is a missing target. A timeout seen twice is not.</summary>
+        /// <summary>
+        /// Only evidence that cannot be repaired by waiting for an in-flight command stream may
+        /// settle on repetition. Missing targets and timeouts are deliberately held until the
+        /// retry window expires; they are commonly caused by harmless cross-system ordering.
+        /// </summary>
         private static bool SettlesOnRepeat(ResyncEvidence evidence) =>
-            evidence != ResyncEvidence.Timeout;
+            evidence == ResyncEvidence.Contradiction || evidence == ResyncEvidence.StreamLoss;
 
         /// <summary>
         /// Drop the report closest to maturing. It is the one that has already had its chance, and

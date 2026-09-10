@@ -14,15 +14,19 @@ namespace CS2MultiplayerMod.Core.Protocol.Messages
     {
         public int OriginPlayerId;
         public long Tick;
+        /// <summary>Monotonic host order for this command. Zero means not host-stamped yet.</summary>
+        public long Sequence;
         public ushort CommandId;
         public byte[] Body;
 
         public SimulationCommandMessage() { }
 
-        public SimulationCommandMessage(int originPlayerId, long tick, ushort commandId, byte[] body)
+        public SimulationCommandMessage(int originPlayerId, long tick, long sequence,
+            ushort commandId, byte[] body)
         {
             OriginPlayerId = originPlayerId;
             Tick = tick;
+            Sequence = sequence;
             CommandId = commandId;
             Body = body ?? System.Array.Empty<byte>();
         }
@@ -33,6 +37,7 @@ namespace CS2MultiplayerMod.Core.Protocol.Messages
         {
             writer.WriteInt(OriginPlayerId);
             writer.WriteLong(Tick);
+            writer.WriteLong(Sequence);
             writer.WriteShort((short)CommandId);
             writer.WriteInt(Body != null ? Body.Length : 0);
             if (Body != null && Body.Length > 0)
@@ -43,6 +48,7 @@ namespace CS2MultiplayerMod.Core.Protocol.Messages
         {
             OriginPlayerId = reader.ReadInt();
             Tick = reader.ReadLong();
+            Sequence = reader.ReadLong();
             CommandId = (ushort)reader.ReadShort();
             int length = reader.ReadInt();
             Body = length > 0 ? reader.ReadBytes(length) : System.Array.Empty<byte>();
