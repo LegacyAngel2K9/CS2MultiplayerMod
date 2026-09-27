@@ -249,6 +249,10 @@ namespace CS2MPMod.Game.Sync.Systems
                 DestroyDefinitions(created);
                 return NativeObjectResult.Retry;
             }
+            // Register the remote root before the owner-description pass. The root itself is born
+            // during this armed transaction, but its generated children can need that expectation
+            // while their one-frame OwnerDefinition is still present.
+            TrackCommittedRemoteBuildings(command, resolved);
             RememberPlayerPlacedSpawnables(command, now);
 
             // Per-phase cost of one native operation. A big relocation is inherently a large
@@ -379,6 +383,7 @@ namespace CS2MPMod.Game.Sync.Systems
             switch (derived)
             {
                 case NativeDeriveResult.Armed:
+                    TrackCommittedRemoteBuildings(command, resolved);
                     SyncLog.Trace(LogTopic.Buildings, "building placement regenerated op=" +
                         command.OperationId + " prefab=" + root.PrefabName);
                     result = NativeObjectResult.Armed;

@@ -1,12 +1,13 @@
+using CS2MultiplayerMod.Core.Sync;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using CS2MPMod.Core.Diagnostics;
-using CS2MPMod.Core.Protocol;
-using CS2MPMod.Core.Session;
-using CS2MPMod.Game.Diagnostics;
-using CS2MPMod.Game.Sync.Commands;
-using CS2MPMod.Game.Sync.Infrastructure;
+using CS2MultiplayerMod.Core.Diagnostics;
+using CS2MultiplayerMod.Core.Protocol;
+using CS2MultiplayerMod.Core.Session;
+using CS2MultiplayerMod.Game.Diagnostics;
+using CS2MultiplayerMod.Game.Sync.Commands;
+using CS2MultiplayerMod.Game.Sync.Infrastructure;
 using Game;
 using Game.Buildings;
 using Game.Common;
@@ -16,7 +17,7 @@ using Game.Tools;
 using Unity.Collections;
 using Unity.Entities;
 
-namespace CS2MPMod.Game.Sync.Systems
+namespace CS2MultiplayerMod.Game.Sync.Systems
 {
     /// <summary>
     /// Makes the host the only author of who lives in a residential building.
@@ -42,14 +43,21 @@ namespace CS2MPMod.Game.Sync.Systems
     // plumbing and stats are in Cycle.cs.
     public partial class ResidentialOccupancySyncSystem : GameSystemBase
     {
-        private const int UpdatePartitions = 16;
+        // The paging, bounded cache, partition walk, retry and priority mechanics the three
+        // property domains share. Only the payloads and the realization policy below are local;
+        // the fields underneath are named views onto this state, not separate containers.
+        private readonly PagedPropertySyncState<ResidentialOccupancySnapshot, CachedProperty, PendingProperty, HostObserved, Entity>
+            _propertyState = new PagedPropertySyncState<ResidentialOccupancySnapshot, CachedProperty, PendingProperty, HostObserved, Entity>();
+        private const int UpdatePartitions = PropertySyncLimits.UpdatePartitions;
 
         /// <summary>
         /// Simulation frames between updates. Must be a power of two: the game gates a system's
-        /// update with <c>frameIndex &amp; (interval - 1)</c>. One of sixteen partitions is examined
-        /// per update, so the whole city is revisited every 1024 simulation frames.
+        /// update with <c>frameIndex &amp; (interval - 1)</c>. Dirty work keeps this cadence.
+        /// Background partitions use a separate speed-normalized rotation.
         /// </summary>
         private const int UpdateIntervalFrames = 64;
+        private readonly SimulationScanCadence _hostScanCadence = new SimulationScanCadence();
+        private readonly SimulationScanCadence _repairScanCadence = new SimulationScanCadence();
 
         // Remote growables are created at the transmitted XZ exactly. A generous four-metre
         // fallback can claim the neighbouring half-lot while the intended building is still in
@@ -71,10 +79,10 @@ namespace CS2MPMod.Game.Sync.Systems
         // conservatism, and the client still applies structural changes through separate budgets.
         private const int PageByteBudget = 224 * 1024;
 
-        private const int MaxIncomingPages = 8;
-        private const int MaxPumpPages = 2;
-        private const int MaxCachedProperties = 131072;
-        private const int MaxPendingIdentities = 4096;
+        private const int MaxIncomingPages = PropertySyncLimits.MaxIncomingPages;
+        private const int MaxPumpPages = PropertySyncLimits.MaxPumpPages;
+        private const int MaxCachedProperties = PropertySyncLimits.MaxCachedProperties;
+        private const int MaxPendingIdentities = PropertySyncLimits.MaxPendingIdentities;
         private const int MaxPendingMoveIns = 4096;
         private const int MaxStagedTransfers = 4096;
         // A lifecycle wave must survive long enough to rotate across the wire without evicting its
@@ -85,7 +93,7 @@ namespace CS2MPMod.Game.Sync.Systems
         private const long DepartureRetentionMs = 900000;
         private const int MaxMoveInFinalizationsPerUpdate = 256;
         private const int MaxPendingRetriesPerPump = 128;
-        private const long ResolveRetryMs = 5000;
+        private const long ResolveRetryMs = PropertySyncLimits.ResolveRetryMs;
         private const long ResolveTimeoutMs = 300000;
         private const int MaxPriorityProperties = 4096;
         private const int PriorityPropertiesPerPage = 64;
@@ -98,7 +106,7 @@ namespace CS2MPMod.Game.Sync.Systems
         // Nothing urgent rides on that rotation - a move-in or move-out reaches the wire through
         // the RentersUpdated event in the same frame it happens, and a page that changes a
         // property reconciles it immediately through the dirty queue.
-        private const int MaxPropertiesObservedPerUpdate = 256;
+        private const int MaxPropertiesObservedPerUpdate = PropertySyncLimits.MaxPropertiesObservedPerUpdate;
         private const int MaxCachedPropertiesWalkedPerUpdate = 256;
         // Retained lifecycle records rotate across pages rather than consuming the whole soft
         // page budget. Leave enough guaranteed room to drain several just-occupied properties per
@@ -122,21 +130,17 @@ namespace CS2MPMod.Game.Sync.Systems
         private const int MaxCitizensRetiredPerUpdate = 48;
         private const int MaxHouseholdsRetiredPerUpdate = 12;
 
-        private const long StatsIntervalMs = 30000;
+        private const long StatsIntervalMs = PropertySyncLimits.StatsIntervalMs;
 
-        private readonly ConcurrentQueue<ResidentialOccupancySnapshot> _incoming =
-            new ConcurrentQueue<ResidentialOccupancySnapshot>();
-        private readonly Dictionary<Entity, CachedProperty> _cache =
-            new Dictionary<Entity, CachedProperty>();
-        private readonly List<Entity>[] _cacheBuckets = CreateBuckets();
-        private readonly HashSet<Entity>[] _cacheBucketMembers = CreateBucketSets();
-        private readonly int[] _cacheBucketCursor = new int[UpdatePartitions];
+        private ConcurrentQueue<ResidentialOccupancySnapshot> _incoming => _propertyState.Incoming;
+        private Dictionary<Entity, CachedProperty> _cache => _propertyState.Cache;
+        private List<Entity>[] _cacheBuckets => _propertyState.CachedPartitions.Buckets;
+        private HashSet<Entity>[] _cacheBucketMembers => _propertyState.CachedPartitions.Members;
+        private int[] _cacheBucketCursor => _propertyState.CachedPartitions.Cursor;
         private readonly List<Entity> _dirty = new List<Entity>();
         private readonly HashSet<Entity> _dirtyMembers = new HashSet<Entity>();
-        private readonly Dictionary<PropertyRentIdentity, PendingProperty> _pending =
-            new Dictionary<PropertyRentIdentity, PendingProperty>();
-        private readonly ConcurrentQueue<PropertyRentIdentity> _pendingOrder =
-            new ConcurrentQueue<PropertyRentIdentity>();
+        private Dictionary<PropertyRentIdentity, PendingProperty> _pending => _propertyState.Pending;
+        private ConcurrentQueue<PropertyRentIdentity> _pendingOrder => _propertyState.PendingOrder;
         private readonly Dictionary<ulong, PendingMoveIn> _pendingMoveIns =
             new Dictionary<ulong, PendingMoveIn>();
         private readonly ConcurrentQueue<ulong> _pendingMoveInOrder = new ConcurrentQueue<ulong>();
@@ -155,21 +159,18 @@ namespace CS2MPMod.Game.Sync.Systems
 
         // Host-side change detection. The rolling baseline is always sent; these entries only
         // shorten the time from an occupancy change to the page that carries it.
-        private readonly Dictionary<Entity, HostObserved> _hostObserved =
-            new Dictionary<Entity, HostObserved>();
-        private readonly List<Entity>[] _hostObservedBuckets = CreateBuckets();
-        private readonly bool[] _hostBucketInitialized = new bool[UpdatePartitions];
-        private readonly int[] _hostBucketCursor = new int[UpdatePartitions];
+        private Dictionary<Entity, HostObserved> _hostObserved => _propertyState.HostObserved;
+        private List<Entity>[] _hostObservedBuckets => _propertyState.HostPartitions.Buckets;
+        private bool[] _hostBucketInitialized => _propertyState.HostPartitions.Initialized;
+        private int[] _hostBucketCursor => _propertyState.HostPartitions.Cursor;
         private readonly Dictionary<Entity, int> _traceSentRosterHashes =
             new Dictionary<Entity, int>();
         private readonly Dictionary<PropertyRentIdentity, int> _traceReceivedRosterHashes =
             new Dictionary<PropertyRentIdentity, int>();
         private readonly Dictionary<ulong, PropertyRentIdentity> _tracePlacedHouseholds =
             new Dictionary<ulong, PropertyRentIdentity>();
-        private readonly Dictionary<PropertyRentIdentity, Entity> _priority =
-            new Dictionary<PropertyRentIdentity, Entity>();
-        private readonly ConcurrentQueue<PropertyRentIdentity> _priorityOrder =
-            new ConcurrentQueue<PropertyRentIdentity>();
+        private Dictionary<PropertyRentIdentity, Entity> _priority => _propertyState.Priority;
+        private ConcurrentQueue<PropertyRentIdentity> _priorityOrder => _propertyState.PriorityOrder;
         private readonly Dictionary<ulong, HostDeparture> _hostDepartures =
             new Dictionary<ulong, HostDeparture>();
         private readonly ConcurrentQueue<ulong> _hostDepartureOrder = new ConcurrentQueue<ulong>();
@@ -218,7 +219,11 @@ namespace CS2MPMod.Game.Sync.Systems
         private int _clientNextPage;
         private bool _clientSweepIntact;
         private bool _syncWasReady;
-        private long _nextPendingPumpMs;
+        private long _nextPendingPumpMs
+        {
+            get => _propertyState.NextPendingPumpMs;
+            set => _propertyState.NextPendingPumpMs = value;
+        }
 
         private long _lastStatsMs;
         private long _sentBytes;
@@ -261,6 +266,8 @@ namespace CS2MPMod.Game.Sync.Systems
         private int _renamedEntities;
         private int _economyCorrections;
         private int _economyDeferred;
+        private int _incomeCorrections;
+        private int _incomeDeferred;
         private int _feeInputCorrections;
         private int _feeInputDeferred;
 
@@ -281,13 +288,11 @@ namespace CS2MPMod.Game.Sync.Systems
             public bool RemoveAfterApply;
         }
 
-        private sealed class PendingProperty
+        private sealed class PendingProperty : PendingPropertyState<OccupancyProperty>
         {
-            public OccupancyProperty Property;
-            public uint SweepId;
-            public long ExpiresMs;
-            public long NextAttemptMs;
-        }
+            public OccupancyProperty Property { get => Entry; set => Entry = value; }
+ }
+
 
         private sealed class PendingMoveIn
         {
@@ -335,19 +340,6 @@ namespace CS2MPMod.Game.Sync.Systems
             public ulong HouseholdId;
         }
 
-        private static List<Entity>[] CreateBuckets()
-        {
-            var result = new List<Entity>[UpdatePartitions];
-            for (int i = 0; i < result.Length; i++) result[i] = new List<Entity>();
-            return result;
-        }
-
-        private static HashSet<Entity>[] CreateBucketSets()
-        {
-            var result = new HashSet<Entity>[UpdatePartitions];
-            for (int i = 0; i < result.Length; i++) result[i] = new HashSet<Entity>();
-            return result;
-        }
 
         public override int GetUpdateInterval(SystemUpdatePhase phase) =>
             phase == SystemUpdatePhase.GameSimulation ? UpdateIntervalFrames : 1;
@@ -439,12 +431,13 @@ namespace CS2MPMod.Game.Sync.Systems
         protected override void OnUpdate()
         {
             MultiplayerService service = Mod.Service;
-            if (service == null || !service.GameplaySyncReady)
+            if (service == null || !service.SimulationSyncReady)
             {
-                // A world-sync barrier closes GameplaySyncReady before installing a replacement
-                // world. Keep client authority held throughout that gap; briefly re-enabling the
+                // A world-sync barrier closes the gate before installing a replacement world.
+                // Keep client authority held throughout that gap; briefly re-enabling the
                 // lifecycle systems is enough for them to create or evict a family before the
-                // first new roster arrives.
+                // first new roster arrives. ApplyLocalAuthority still releases the hold when the
+                // session is running without simulation sync at all.
                 if (service != null && service.Session.Role == SessionRole.Client)
                     ApplyLocalAuthority(service.Session);
                 else
@@ -461,36 +454,26 @@ namespace CS2MPMod.Game.Sync.Systems
             MultiplayerSession session = service.Session;
             ApplyLocalAuthority(session);
 
-            int bucket = (int)(SimulationUtils.GetUpdateFrameWithInterval(
-                _simulationSystem.frameIndex, UpdateIntervalFrames, UpdatePartitions) %
-                UpdatePartitions);
-
-            // Two sibling scopes rather than one around the method: the branches are mutually
-            // exclusive, so the profiler's total stays a sum of what it lists.
             if (session.Role == SessionRole.Host)
             {
-                using (Diagnostics.SyncProfiler.Measure("Occupancy.HostScan", Diagnostics.SyncZone.Residential))
+                DropIncomingPages();
+                int bucket;
+                if (_hostScanCadence.TryTakePartition(_simulationSystem.selectedSpeed,
+                        UpdatePartitions, out bucket))
                 {
-                    DropIncomingPages();
-                    // Departures are sampled by ResidentialOccupancyDepartureCaptureSystem, which
-                    // sits directly in front of the native executor at that executor's own
-                    // interval. Repeating the walk here only ever re-read a query it had already
-                    // drained on a more recent frame.
-                    ScanTrackedHostHouseholds(service.NowMs);
-                    ScanTrackedHostCitizens(service.NowMs);
-                    ScanHostChanges(bucket);
+                    using (Diagnostics.SyncProfiler.Measure("Occupancy.HostHouseholds", Diagnostics.SyncZone.Residential))
+                        ScanTrackedHostHouseholds(service.NowMs);
+                    using (Diagnostics.SyncProfiler.Measure("Occupancy.HostCitizens", Diagnostics.SyncZone.Residential))
+                        ScanTrackedHostCitizens(service.NowMs);
+                    using (Diagnostics.SyncProfiler.Measure("Occupancy.HostScan", Diagnostics.SyncZone.Residential))
+                        ScanHostChanges(bucket);
                 }
             }
             else
             {
-                using (Diagnostics.SyncProfiler.Measure("Occupancy.Apply", Diagnostics.SyncZone.Residential))
-                {
-                    // Normally the city-state pump has already turned every arrived page into
-                    // cache entries. Pump once more as a harmless fallback before this bucket
-                    // is consumed.
+                using (Diagnostics.SyncProfiler.Measure("Occupancy.Pump", Diagnostics.SyncZone.Residential))
                     PumpIncoming();
-                    ApplyPending(bucket);
-                }
+                ApplyPending();
             }
             ReportStats(session, service.NowMs);
         }

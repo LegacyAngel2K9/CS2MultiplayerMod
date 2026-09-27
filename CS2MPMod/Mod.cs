@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using Colossal.IO.AssetDatabase;
 using Colossal.Logging;
 using CS2MPMod.Core.Diagnostics;
@@ -51,9 +51,62 @@ namespace CS2MPMod
         public static MultiplayerService Service;
 
         /// <summary>
-        /// The version this build reports - to the log, and to a peer during the handshake.
+        /// The version this build reports to the log, the flight log and the options screen -
+        /// the published one, hotfix suffix and all. What a peer is shown is
+        /// <see cref="CompatibilityVersion"/>.
+        ///
+        /// Read from the informational version, which the build stamps from
+        /// Properties/PublishConfiguration.xml (see the csproj): that is the number the store
+        /// shows and the one a player quotes in a report. The assembly version is only the
+        /// fallback - it stays 1.0.0.0 across releases, so while it was the source every build
+        /// called itself the same thing and the handshake's version check could never fire.
         /// </summary>
-        private static string Version => typeof(Mod).Assembly.GetName().Version.ToString();
+        internal static string Version => _version ?? (_version = ReadVersion());
+
+        /// <summary>
+        /// The version a peer is compared against: the numeric release part of
+        /// <see cref="Version"/>, so "0.1.6.1h1" meets "0.1.6.1". A hotfix suffix marks a build
+        /// that changed nothing the two machines have to agree on - the wire, the prefabs and the
+        /// simulation are the release's - so those two still play together, while a different
+        /// release is refused (the host can still admit it: IgnoreModCompatibilityChecks).
+        /// </summary>
+        internal static string CompatibilityVersion =>
+            _compatibilityVersion ?? (_compatibilityVersion = ReleasePart(Version));
+
+        private static string _version;
+        private static string _compatibilityVersion;
+
+        /// <summary>The leading digits-and-dots of a version, without a trailing dot.</summary>
+        private static string ReleasePart(string version)
+        {
+            if (string.IsNullOrEmpty(version)) return version;
+            int end = 0;
+            while (end < version.Length && (char.IsDigit(version[end]) || version[end] == '.')) end++;
+            while (end > 0 && version[end - 1] == '.') end--;
+            return end > 0 ? version.Substring(0, end) : version;
+        }
+
+        private static string ReadVersion()
+        {
+            try
+            {
+                var stamped = (System.Reflection.AssemblyInformationalVersionAttribute)
+                    System.Attribute.GetCustomAttribute(typeof(Mod).Assembly,
+                        typeof(System.Reflection.AssemblyInformationalVersionAttribute));
+                if (stamped != null && !string.IsNullOrEmpty(stamped.InformationalVersion))
+                {
+                    // A build that has SourceLink or a revision id appends "+<sha>"; these strings
+                    // are read and compared, so keep only the part a human would call a version.
+                    string text = stamped.InformationalVersion;
+                    int plus = text.IndexOf('+');
+                    if (plus > 0) text = text.Substring(0, plus);
+                    if (text.Length > 0) return text;
+                }
+            }
+            catch { /* fall through to the assembly version */ }
+
+            return typeof(Mod).Assembly.GetName().Version.ToString();
+        }
 
         public void OnLoad(UpdateSystem updateSystem)
         {
@@ -164,6 +217,13 @@ namespace CS2MPMod
             // the same authoritative snapshot when the residents panel calculates its averages.
             updateSystem.UpdateAfter<Game.Sync.Systems.ResidentialHouseholdEconomyCorrectionSystem,
                 global::Game.Simulation.RentAdjustSystem>(SystemUpdatePhase.GameSimulation);
+            // Income is the one household scalar whose readers run before that boundary: the
+            // wealth component of citizen wellbeing is evaluated a few systems after the pass that
+            // recomputes income from this peer's own employment graph, and the building's
+            // good-wealth prop requirement is read later still. Restore the host value here, in
+            // between, or both follow the client's local employment instead of the host's.
+            updateSystem.UpdateAfter<Game.Sync.Systems.ResidentialHouseholdIncomeBoundarySystem,
+                global::Game.Simulation.HouseholdBehaviorSystem>(SystemUpdatePhase.GameSimulation);
             // ResourceBuyerSystem runs real shoppers and SaleEvents after the earlier household
             // boundary. Keep those agents alive, then correct the money and shopped-value result
             // to the host snapshot at the first safe point after the sale is booked.
@@ -181,11 +241,9 @@ namespace CS2MPMod
             // they also produce the figures and demand the rest of the simulation reads.
             updateSystem.UpdateBefore<Game.Sync.Systems.CompanyLifecycleBoundarySystem,
                 global::Game.Simulation.CompanyMoveAwaySystem>(SystemUpdatePhase.GameSimulation);
-            // Directly after the game's own company bookkeeping, at that system's own interval and
-            // over that system's own UpdateFrame partition. This ordering IS the feature: an
-            // earlier attempt corrected on a 1024-frame rotation while CompanyEconomyStatisticSystem
-            // rewrites the same fields every 128 frames, so every correction was overwritten
-            // several times over before the next one arrived and the panels never settled.
+            // The host captures company bookkeeping at its native cadence. Clients hold the
+            // accounting calculator and consume host figures; keep this partition schedule for
+            // capture and for repairing fields also touched by other local company systems.
             updateSystem.UpdateAfter<Game.Sync.Systems.CompanyStatsSyncSystem,
                 global::Game.Simulation.CompanyEconomyStatisticSystem>(
                 SystemUpdatePhase.GameSimulation);
@@ -231,6 +289,11 @@ namespace CS2MPMod
             // player is paused (so partners still see where they are), and GameSimulation
             // barely ticked it - the live log showed ~1 position sent per 30 s.
             updateSystem.UpdateAt<Game.Sync.Players.PlayerCursorSyncSystem>(SystemUpdatePhase.UIUpdate);
+            // Raycast phase, after the tool's own input: the only point where an extra raycast
+            // input still joins this frame's job. Without it the default tool's narrow search
+            // leaves every road, track and pipe out of what a partner is shown pointing at.
+            updateSystem.UpdateAfter<Game.Sync.Players.PlayerHoverRaycastSystem,
+                global::Game.Tools.ToolRaycastSystem>(SystemUpdatePhase.Raycast);
             // Renders the other players' camera positions as ground rings. Rendering phase
             // so the markers draw every frame, in every state (including paused).
             updateSystem.UpdateAt<Game.Sync.Players.RemotePlayerMarkerSystem>(SystemUpdatePhase.Rendering);
@@ -245,6 +308,9 @@ namespace CS2MPMod
             // from a tool apply are still alive (they are gone by GameSimulation).
             updateSystem.UpdateAt<Game.Sync.Systems.BuildSyncSystem>(SystemUpdatePhase.ModificationEnd);
             updateSystem.UpdateAt<Game.Sync.Systems.Net.NetSyncSystem>(SystemUpdatePhase.ModificationEnd);
+            // Edge-only refreshes must include their junctions before native network processing.
+            updateSystem.UpdateBefore<Game.Sync.Systems.Net.NetJunctionRefreshSystem,
+                global::Game.Net.ReferencesSystem>(SystemUpdatePhase.Modification2B);
             updateSystem.UpdateAt<Game.Sync.Systems.DeleteSyncSystem>(SystemUpdatePhase.ModificationEnd);
             // After DeleteSyncSystem, which collects this frame's tool-originated removals first:
             // a bulldozed zoned building is a player action and already travels as a delete, so
@@ -261,6 +327,12 @@ namespace CS2MPMod
             updateSystem.UpdateAt<Game.Sync.Systems.AreaSyncSystem>(SystemUpdatePhase.ModificationEnd);
             updateSystem.UpdateAt<Game.Sync.Systems.RouteSyncSystem>(SystemUpdatePhase.ModificationEnd);
             updateSystem.UpdateAt<Game.Sync.Systems.TilePurchaseSyncSystem>(SystemUpdatePhase.ModificationEnd);
+            // ModificationEnd, with the rest of the capture systems: another mod's tool has applied
+            // by this point in the frame, and the engine's chunk-change record still says which of
+            // its types were written to. It also keeps running while the game is paused, and these
+            // mods are used on a paused city as much as a running one.
+            updateSystem.UpdateAt<Game.Sync.Systems.Mods.ModStateSyncSystem>(
+                SystemUpdatePhase.ModificationEnd);
             // ModificationEnd, after the game's event initialization at Modification2: that pass is
             // what turns a bare disaster event into a placed one (position, radius, duration), and
             // the Created tag it keys on is gone by the next frame. Capturing here reads the
@@ -329,7 +401,8 @@ namespace CS2MPMod
             // decide whether two players can even play together.
             SyncLog.Event(LogTopic.Startup, "Loaded: mod v" + Version + ", protocol v" +
                 ProtocolConstants.ProtocolVersion + ", game v" + UnityEngine.Application.version +
-                ", sync systems registered.");
+                ", sync systems registered, verbose logging " +
+                (Setting != null && Setting.VerboseLogging ? "on" : "off") + ".");
         }
 
         public void OnDispose()

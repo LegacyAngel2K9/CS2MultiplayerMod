@@ -1,7 +1,7 @@
 using System;
-using CS2MPMod.Localization;
+using CS2MultiplayerMod.Localization;
 
-namespace CS2MPMod.Game
+namespace CS2MultiplayerMod.Game
 {
     /// <summary>
     /// Tracks which Cities: Skylines II builds this mod has actually been tested
@@ -14,14 +14,13 @@ namespace CS2MPMod.Game
     public static class GameVersionCheck
     {
         /// <summary>
-        /// Game builds targeted by the current API integration and local smoke tests.
-        /// This is not a guarantee that all multiplayer scenarios have been validated.
-        /// Values match the build string reported by the game on host/join.
-        /// Older builds are not listed: the integration now requires Household.m_Income
-        /// and the 24-argument object generator with PlacementOverrides.
+        /// Game builds verified to work with this mod. Update this list whenever the
+        /// mod has been exercised against a new patch. Values match the build string
+        /// the game reports (e.g. "1.6.0f1"), which is also logged on host/join.
         /// </summary>
         public static readonly string[] TestedVersions =
         {
+            "1.6.0f1",
             "1.6.2f1",
         };
 

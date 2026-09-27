@@ -93,6 +93,7 @@ namespace CS2MPMod.Core.Session
         private void OnTransportDisconnected(ConnectionId connection, string reason)
         {
             Peer peer;
+            _puntedConnections.Remove(connection.Value);
             if (_peers.TryGetValue(connection.Value, out peer))
             {
                 _peers.Remove(connection.Value);
@@ -153,6 +154,9 @@ namespace CS2MPMod.Core.Session
 
         private void OnTransportData(ConnectionId connection, byte[] payload, long nowUnixMs)
         {
+            // Everything this connection had already sent before it was punted is discarded.
+            if (_puntedConnections.Contains(connection.Value)) return;
+
             Peer peer;
             if (_peers.TryGetValue(connection.Value, out peer))
                 peer.LastSeenUnixMs = nowUnixMs;
@@ -246,7 +250,8 @@ namespace CS2MPMod.Core.Session
                     break;
                 case MessageType.ResyncRequest:
                     HandleResyncRequest(connection, peer, nowUnixMs,
-                        ((ResyncRequestMessage)message).Reason);
+                        ((ResyncRequestMessage)message).Reason,
+                        ((ResyncRequestMessage)message).IsAutomatic);
                     break;
                 case MessageType.WorldSyncControl:
                     HandleWorldSyncControl(connection, peer, (WorldSyncControlMessage)message);
@@ -285,6 +290,9 @@ namespace CS2MPMod.Core.Session
                     ".");
                 return;
             }
+
+            // One security action per connection: a queued flood is one event, not one per frame.
+            if (!_puntedConnections.Add(connection.Value)) return;
 
             string who = peer != null
                 ? "player #" + peer.PlayerId + " '" + (peer.Name ?? "<pending>") + "'"

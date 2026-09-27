@@ -3,7 +3,7 @@ namespace CS2MPMod.Core.Protocol.Messages
     /// <summary>
     /// Client -> host: "stream current world now." Sent when the player runs <c>/sync</c>
     /// due to suspected city drift, and when the client's own sync pipeline settles on a
-    /// world reload. Host saves and streams live world - periodic resync but on demand.
+    /// world reload. Host saves and streams its live world - a full re-baseline, on demand.
     ///
     /// <see cref="Reason"/> carries WHY, so the host's log distinguishes a player pressing
     /// the button from a client that could not apply an edit. It is untrusted display text:
@@ -12,16 +12,19 @@ namespace CS2MPMod.Core.Protocol.Messages
     public sealed class ResyncRequestMessage : INetMessage
     {
         public int OriginPlayerId;
+        /// <summary>Notice attribution only; never changes permission or recovery policy.</summary>
+        public bool IsAutomatic;
 
         /// <summary>Short human-readable cause, for logs only. Never null after a read.</summary>
         public string Reason;
 
         public ResyncRequestMessage() { }
 
-        public ResyncRequestMessage(int originPlayerId, string reason = null)
+        public ResyncRequestMessage(int originPlayerId, string reason = null, bool isAutomatic = false)
         {
             OriginPlayerId = originPlayerId;
             Reason = reason;
+            IsAutomatic = isAutomatic;
         }
 
         public MessageType Type => MessageType.ResyncRequest;
@@ -29,12 +32,14 @@ namespace CS2MPMod.Core.Protocol.Messages
         public void Write(NetworkWriter writer)
         {
             writer.WriteInt(OriginPlayerId);
+            writer.WriteBool(IsAutomatic);
             writer.WriteString(WireGuard.SanitizeText(Reason, WireGuard.MaxResyncReasonLength));
         }
 
         public void Read(NetworkReader reader)
         {
             OriginPlayerId = reader.ReadInt();
+            IsAutomatic = reader.ReadBool();
             Reason = WireGuard.SanitizeText(reader.ReadString(), WireGuard.MaxResyncReasonLength);
         }
     }

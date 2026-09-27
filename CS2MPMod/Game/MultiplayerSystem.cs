@@ -1,11 +1,11 @@
 using Game;
 using Game.SceneFlow;
 using Unity.Entities;
-using CS2MPMod.Core.Diagnostics;
-using CS2MPMod.Core.Session;
-using CS2MPMod.Game.Diagnostics;
+using CS2MultiplayerMod.Core.Diagnostics;
+using CS2MultiplayerMod.Core.Session;
+using CS2MultiplayerMod.Game.Diagnostics;
 
-namespace CS2MPMod.Game
+namespace CS2MultiplayerMod.Game
 {
     /// <summary>
     /// ECS heartbeat for multiplayer. Runs at <see cref="global::Game.SystemUpdatePhase.UIUpdate"/>
@@ -18,6 +18,7 @@ namespace CS2MPMod.Game
         private const long ActiveHealthIntervalMs = 10000;
         private const long IdleHealthIntervalMs = 60000;
 
+        private global::Game.Simulation.SimulationSystem _simulation;
         private EntityQuery _tempEntities;
         private EntityQuery _definitionEntities;
         private long _lastHealthMs;
@@ -26,6 +27,7 @@ namespace CS2MPMod.Game
         protected override void OnCreate()
         {
             base.OnCreate();
+            _simulation = World.GetOrCreateSystemManaged<global::Game.Simulation.SimulationSystem>();
             SyncLog.Detail(LogTopic.Startup, nameof(MultiplayerSystem) + " created.");
 
             // Trend counters for the flight log: live preview Temps and definition
@@ -47,7 +49,6 @@ namespace CS2MPMod.Game
             global::Game.GameMode mode)
         {
             base.OnGamePreload(purpose, mode);
-            FrameProbe.Reset();
             try
             {
                 MultiplayerService service = Mod.Service;
@@ -63,11 +64,10 @@ namespace CS2MPMod.Game
         protected override void OnUpdate()
         {
             MultiplayerService service = Mod.Service;
-            if (service == null) { FrameProbe.Reset(); return; }
+            if (service == null) return;
 
             if (!MultiplayerService.ModEnabled)
             {
-                FrameProbe.Reset();
                 if (service.Session.Role != SessionRole.None)
                 {
                     SyncLog.Detail(LogTopic.Startup,
@@ -89,13 +89,8 @@ namespace CS2MPMod.Game
             // This system runs at UIUpdate, which the game drives once per rendered frame, so it
             // is the honest place to time one. Only while gameplay is live: a world load would
             // otherwise report its own multi-second frames as the session's.
-            var manager = GameManager.instance;
-            bool inLoadedCity = manager != null && manager.gameMode.IsGame() && !manager.isGameLoading;
-            if (inLoadedCity && service.GameplaySyncReady)
-                FrameProbe.Sample(service.Session.Role == SessionRole.Host ? "host" : "client");
-            else if (inLoadedCity && service.Session.Role == SessionRole.None &&
-                service.Session.Status == SessionStatus.Offline && service.WorldPhase == ClientWorldPhase.None)
-                FrameProbe.Sample("singleplayer");
+            if (service.GameplaySyncReady)
+                FrameProbe.Sample(_simulation.selectedSpeed, _simulation.frameIndex);
             else FrameProbe.Reset();
         }
 

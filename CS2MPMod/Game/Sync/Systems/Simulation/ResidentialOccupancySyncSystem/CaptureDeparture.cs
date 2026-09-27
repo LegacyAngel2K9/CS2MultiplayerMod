@@ -2,7 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text;
-using CS2MPMod.Game.Sync.Commands;
+using CS2MultiplayerMod.Game.Sync.Commands;
+using CS2MultiplayerMod.Game.Sync.Infrastructure;
 using Game.Buildings;
 using Game.Citizens;
 using Game.Common;
@@ -14,7 +15,7 @@ using Game.Vehicles;
 using Unity.Collections;
 using Unity.Entities;
 
-namespace CS2MPMod.Game.Sync.Systems
+namespace CS2MultiplayerMod.Game.Sync.Systems
 {
     // Noticing that a household or citizen the host was tracking has gone, and recording it so the
     // client retires its own copy. A departure has to be stated explicitly: an absolute roster
@@ -200,8 +201,12 @@ namespace CS2MPMod.Game.Sync.Systems
             }
         }
 
+        private readonly PassMembershipIndex<Entity, Entity> _hostRenterMembership =
+            new PassMembershipIndex<Entity, Entity>();
+
         private void ScanTrackedHostHouseholds(long now)
         {
+            _hostRenterMembership.Reset();
             int examined = System.Math.Min(MaxTrackedHouseholdChecksPerUpdate,
                 _hostHouseholdOrder.Count);
             while (examined-- > 0 && _hostHouseholdOrder.TryDequeue(out ulong householdId))
@@ -242,11 +247,16 @@ namespace CS2MPMod.Game.Sync.Systems
         {
             if (!EntityManager.HasComponent<PropertyRenter>(household)) return false;
             Entity property = EntityManager.GetComponentData<PropertyRenter>(household).m_Property;
-            if (!IsLiveProperty(property)) return false;
-            DynamicBuffer<Renter> renters = EntityManager.GetBuffer<Renter>(property, true);
-            for (int i = 0; i < renters.Length; i++)
-                if (renters[i].m_Renter == household) return true;
-            return false;
+            // Many consecutive families share a tower. Index its renter list once in this
+            // read-only pass instead of searching it again for each family (quadratic work).
+            bool firstVisit;
+            HashSet<Entity> members = _hostRenterMembership.GetMembers(property, out firstVisit);
+            if (firstVisit && IsLiveProperty(property))
+            {
+                DynamicBuffer<Renter> renters = EntityManager.GetBuffer<Renter>(property, true);
+                for (int i = 0; i < renters.Length; i++) members.Add(renters[i].m_Renter);
+            }
+            return members.Contains(household);
         }
 
         private void ObserveHostHouseholdEntity(Entity household, OccupancyHousehold captured,

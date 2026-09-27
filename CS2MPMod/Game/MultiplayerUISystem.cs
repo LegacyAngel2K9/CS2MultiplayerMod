@@ -221,8 +221,12 @@ namespace CS2MPMod.Game
                 () => Mod.Setting != null && Mod.Setting.LanOnly));
             AddUpdateBinding(new GetterValueBinding<bool>(Group, "requireApproval",
                 () => Mod.Setting == null || Mod.Setting.RequireJoinApproval));
-            AddUpdateBinding(new GetterValueBinding<string>(Group, "resyncMinutes",
-                () => Mod.Setting != null ? Mod.Setting.ResyncMinutes : "15"));
+            // Reads the SESSION's answer once one is running: a client's own setting has no say,
+            // and a host that changed the box mid-session has not changed the session.
+            AddUpdateBinding(new GetterValueBinding<bool>(Group, "simulationSync",
+                () => Mod.Service != null && Mod.Service.Session.Role != SessionRole.None
+                    ? Mod.Service.SimulationSyncEnabled
+                    : Mod.Setting == null || Mod.Setting.SimulationSync));
 
             // Host setup edits. HostPort/HostPassword setters already refuse changes
             // mid-session inside Setting, so no extra guarding here.
@@ -245,8 +249,8 @@ namespace CS2MPMod.Game
                 value => { if (Mod.Setting != null) Mod.Setting.LanOnly = value; }));
             AddBinding(new TriggerBinding<bool>(Group, "setRequireApproval",
                 value => { if (Mod.Setting != null) Mod.Setting.RequireJoinApproval = value; }));
-            AddBinding(new TriggerBinding<string>(Group, "setResyncMinutes",
-                value => { if (Mod.Setting != null) Mod.Setting.ResyncMinutes = value; }));
+            AddBinding(new TriggerBinding<bool>(Group, "setSimulationSync",
+                value => { if (Mod.Setting != null) Mod.Setting.SimulationSync = value; }));
 
             AddBinding(new TriggerBinding<string>(Group, "sendChat",
                 value => { if (Mod.Service != null) Mod.Service.SendChatFromUi(value); }));

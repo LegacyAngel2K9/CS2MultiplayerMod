@@ -185,13 +185,12 @@ In normal mode this warning blocks Host and Join. Disable the listed mods in the
 
 Ignore Mod Compatibility Checks (Own Risk) is enabled while other mods are active, or a host admitted a different CS2 Multiplayer Mod build. This is advisory but serious: desyncs, missing prefabs, broken saves, and crashes are possible. The network protocol, game version, and DLC set are still checked.
 
-### Invalid port, player limit, or re-sync interval
+### Invalid port or player limit
 
 Recognizable log text:
 
 - `Invalid host port` or `Invalid join port` — the default port `25001` is used.
 - `Invalid max players` — the default of `8` is used; valid values are `2` through `32`.
-- `World re-sync interval ... is not a whole number` — the safe default is used.
 
 Correct the value in Options before the next session.
 
@@ -290,7 +289,7 @@ Include:
 
 You do not have to switch anything on first. Connects, disconnects, world transfers, resyncs, dropped actions and every fault are logged whatever your settings are.
 
-If you are asked for more detail, the mod's **Logging** options tab has one switch per feature - Session, Connection, World Transfer, Resync, Roads & Networks, Buildings & Objects and so on. Turn on the one that matches the problem, or **Log Everything** if you are not sure, then reproduce the problem and send the file again.
+If you are asked for more detail, turn on **Verbose Logging** on the mod's **General** options tab, reproduce the problem and send the file again. It adds the per-action detail underneath the events above; it makes the log longer, not the game slower.
 
 Never post a session password. Network addresses and profile paths are redacted by the mod where it controls the log line, but review files before sharing them publicly.
 

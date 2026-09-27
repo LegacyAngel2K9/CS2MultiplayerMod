@@ -1,3 +1,4 @@
+using CS2MultiplayerMod.Core.Sync;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -24,20 +25,14 @@ namespace CS2MPMod.Game.Sync.Systems
     /// building each business occupies, the money-facing figures behind its panel, and the goods
     /// it is holding.
     ///
-    /// <para><b>Why the first attempt at the figures failed.</b> It corrected companies on a
-    /// 1024-frame rotation while <c>CompanyEconomyStatisticSystem</c> rewrites the same fields
-    /// every <b>128</b> frames, over a partition that system picks from its own frame index. Every
-    /// correction was overwritten roughly eight times before the next one arrived, usually on a
-    /// different set of companies, so the panels never settled. This system therefore borrows that
-    /// writer's schedule exactly - same interval, same partition, ordered directly after it - and
-    /// each company is corrected in the very frame its local value was recomputed.</para>
+    /// The host captures accounting on CompanyEconomyStatisticSystem's partition schedule.
+    /// Clients hold that calculator and use the transmitted figures, avoiding both duplicate
+    /// accounting and subsequent corrections of its results. Other local company systems still
+    /// handle resource orders and transport, so their shared fields retain the repair boundary.
     ///
-    /// <para><b>Tenancy is authority, not correction.</b> Figures can be corrected because the
-    /// local writer is a pure function of local state. Occupancy cannot: a client that keeps
-    /// choosing its own tenants would spawn and house businesses the host never had, and no
-    /// amount of correcting after the fact removes them. So the client stops deciding - see
-    /// Authority.cs - and the host's absolute per-building roster is realized through the game's
-    /// own rent-action queue, exactly as residential occupancy does for households.</para>
+    /// Clients also hold tenant creation and property search. The host's absolute per-building
+    /// roster is realized through the native rent-action queue, as residential occupancy does
+    /// for households. Authority.cs restores the held systems when simulation sync is disabled.
     ///
     /// <para><b>What this costs.</b> In the steady state a matching building costs one dictionary
     /// lookup and a field comparison, and nothing structural happens at all. Structural work -
@@ -52,7 +47,15 @@ namespace CS2MPMod.Game.Sync.Systems
     /// </summary>
     public partial class CompanyStatsSyncSystem : GameSystemBase
     {
-        private const int UpdatePartitions = 16;
+        // The paging, bounded cache, partition walk, retry and priority mechanics the three
+        // property domains share. Only the payloads and the realization policy below are local;
+        // the fields underneath are named views onto this state, not separate containers.
+        private readonly PagedPropertySyncState<CompanyStatsSnapshot, CachedEntry, PendingEntry, int, Entity>
+            _propertyState = new PagedPropertySyncState<CompanyStatsSnapshot, CachedEntry, PendingEntry, int, Entity>();
+        private const int UpdatePartitions = PropertySyncLimits.UpdatePartitions;
+        private readonly SimulationScanCadence _hostScanCadence = new SimulationScanCadence();
+        private readonly SimulationScanCadence _stateScanCadence = new SimulationScanCadence();
+        private readonly SimulationScanCadence _tenancyScanCadence = new SimulationScanCadence();
 
         /// <summary>
         /// Matches <c>CompanyEconomyStatisticSystem.kUpdatesPerDay</c>. Both the interval and the
@@ -66,14 +69,14 @@ namespace CS2MPMod.Game.Sync.Systems
         private const float AnchorSearchRadius = 8f;
         private const float AmbiguousDistanceEpsilon = 0.01f;
 
-        private const int MaxIncomingPages = 8;
-        private const int MaxPumpPages = 2;
-        private const int MaxCachedProperties = 131072;
-        private const int MaxPendingIdentities = 4096;
+        private const int MaxIncomingPages = PropertySyncLimits.MaxIncomingPages;
+        private const int MaxPumpPages = PropertySyncLimits.MaxPumpPages;
+        private const int MaxCachedProperties = PropertySyncLimits.MaxCachedProperties;
+        private const int MaxPendingIdentities = PropertySyncLimits.MaxPendingIdentities;
         private const int MaxPendingRetriesPerUpdate = 192;
-        private const long ResolveRetryMs = 5000;
+        private const long ResolveRetryMs = PropertySyncLimits.ResolveRetryMs;
         private const long ResolveTimeoutMs = 120000;
-        private const int MaxPriorityEntries = 2048;
+        private const int MaxPriorityEntries = PropertySyncLimits.MaxPriorityEntries;
         // A busy dense district changes far more than 32 company records per second. Bytes, not
         // the old low-density entry count, are the meaningful bound because employee rosters make
         // entry sizes vary by orders of magnitude.
@@ -86,7 +89,7 @@ namespace CS2MPMod.Game.Sync.Systems
         /// sweep sends every workplace regardless; this ceiling only stops the detector's cost
         /// from growing with the city, as on the occupancy and rent observers.
         /// </summary>
-        private const int MaxPropertiesObservedPerUpdate = 256;
+        private const int MaxPropertiesObservedPerUpdate = PropertySyncLimits.MaxPropertiesObservedPerUpdate;
 
         /// <summary>
         /// Cached buildings the tenancy pass re-examines per update once its dirty queue is empty.
@@ -94,6 +97,7 @@ namespace CS2MPMod.Game.Sync.Systems
         /// on a page and is handled immediately through the dirty queue instead.
         /// </summary>
         private const int MaxTenancyWalkedPerUpdate = 64;
+        private const int MaxTenancyDirtyPerBoundary = 128;
 
         /// <summary>
         /// Arrived pages are applied on a 16-frame boundary rather than waiting for the target
@@ -149,17 +153,14 @@ namespace CS2MPMod.Game.Sync.Systems
         /// <summary>Cap on the queue of just-changed buildings; the rolling walk is the backstop.</summary>
         private const int MaxDirtyProperties = 8192;
 
-        private const long StatsIntervalMs = 30000;
+        private const long StatsIntervalMs = PropertySyncLimits.StatsIntervalMs;
 
-        private readonly ConcurrentQueue<CompanyStatsSnapshot> _incoming =
-            new ConcurrentQueue<CompanyStatsSnapshot>();
+        private ConcurrentQueue<CompanyStatsSnapshot> _incoming => _propertyState.Incoming;
 
         /// <summary>Resolved workplace building -> what the host says about it.</summary>
-        private readonly Dictionary<Entity, CachedEntry> _cache = new Dictionary<Entity, CachedEntry>();
-        private readonly Dictionary<PropertyRentIdentity, PendingEntry> _pending =
-            new Dictionary<PropertyRentIdentity, PendingEntry>();
-        private readonly ConcurrentQueue<PropertyRentIdentity> _pendingOrder =
-            new ConcurrentQueue<PropertyRentIdentity>();
+        private Dictionary<Entity, CachedEntry> _cache => _propertyState.Cache;
+        private Dictionary<PropertyRentIdentity, PendingEntry> _pending => _propertyState.Pending;
+        private ConcurrentQueue<PropertyRentIdentity> _pendingOrder => _propertyState.PendingOrder;
         private readonly List<Entity> _cacheScratch = new List<Entity>();
 
         private readonly List<Entity> _dirty = new List<Entity>();
@@ -187,6 +188,7 @@ namespace CS2MPMod.Game.Sync.Systems
         private readonly List<Entity> _efficiencyDirty = new List<Entity>();
         private readonly HashSet<Entity> _efficiencyDirtyMembers = new HashSet<Entity>();
         private readonly List<Entity> _stateRetryScratch = new List<Entity>();
+        private readonly HashSet<Entity> _stateAppliedThisBoundary = new HashSet<Entity>();
         private readonly List<Entity> _tenancyOrder = new List<Entity>();
         private int _tenancyCursor;
         private int _stateCursor;
@@ -195,15 +197,13 @@ namespace CS2MPMod.Game.Sync.Systems
         private readonly HashSet<Entity> _authorizedMoveAways = new HashSet<Entity>();
         private readonly List<Entity> _authorizedScratch = new List<Entity>();
 
-        private readonly Dictionary<Entity, int> _hostObserved = new Dictionary<Entity, int>();
+        private Dictionary<Entity, int> _hostObserved => _propertyState.HostObserved;
         private readonly Dictionary<Entity, int> _hostEmployeeObserved =
             new Dictionary<Entity, int>();
-        private readonly bool[] _hostPartitionInitialized = new bool[UpdatePartitions];
-        private readonly int[] _hostPartitionCursor = new int[UpdatePartitions];
-        private readonly Dictionary<PropertyRentIdentity, Entity> _priority =
-            new Dictionary<PropertyRentIdentity, Entity>();
-        private readonly ConcurrentQueue<PropertyRentIdentity> _priorityOrder =
-            new ConcurrentQueue<PropertyRentIdentity>();
+        private bool[] _hostPartitionInitialized => _propertyState.HostPartitions.Initialized;
+        private int[] _hostPartitionCursor => _propertyState.HostPartitions.Cursor;
+        private Dictionary<PropertyRentIdentity, Entity> _priority => _propertyState.Priority;
+        private ConcurrentQueue<PropertyRentIdentity> _priorityOrder => _propertyState.PriorityOrder;
 
         private readonly List<CompanyStatsResource> _resourceScratch =
             new List<CompanyStatsResource>();
@@ -251,7 +251,11 @@ namespace CS2MPMod.Game.Sync.Systems
         private int _clientNextPage;
         private bool _clientSweepIntact;
         private bool _syncWasReady;
-        private long _nextPendingPumpMs;
+        private long _nextPendingPumpMs
+        {
+            get => _propertyState.NextPendingPumpMs;
+            set => _propertyState.NextPendingPumpMs = value;
+        }
 
         private long _lastStatsMs;
         private long _sentBytes;
@@ -271,13 +275,9 @@ namespace CS2MPMod.Game.Sync.Systems
             public uint LastSeenSweep;
         }
 
-        private sealed class PendingEntry
-        {
-            public CompanyStatsEntry Entry;
-            public uint SweepId;
-            public long ExpiresMs;
-            public long NextAttemptMs;
-        }
+        private sealed class PendingEntry : PendingPropertyState<CompanyStatsEntry>
+        { }
+
 
         private struct ResolvedEmployee
         {
@@ -353,12 +353,13 @@ namespace CS2MPMod.Game.Sync.Systems
             using (Diagnostics.SyncProfiler.Measure("CompanyStats"))
             {
                 MultiplayerService service = Mod.Service;
-                if (service == null || !service.GameplaySyncReady)
+                if (service == null || !service.SimulationSyncReady)
                 {
-                    // A world-sync barrier closes GameplaySyncReady before installing a
-                    // replacement world. Keep client authority held across that gap: briefly
-                    // re-enabling the spawners is enough for them to open businesses this peer's
-                    // own way before the first new page arrives.
+                    // A world-sync barrier closes the gate before installing a replacement
+                    // world. Keep client authority held across that gap: briefly re-enabling the
+                    // spawners is enough for them to open businesses this peer's own way before
+                    // the first new page arrives. ApplyLocalAuthority still releases the hold
+                    // when the session is running without simulation sync at all.
                     if (service != null && service.Session.Role == SessionRole.Client)
                         ApplyLocalAuthority(service.Session);
                     else
@@ -376,12 +377,14 @@ namespace CS2MPMod.Game.Sync.Systems
                 // own job schedule. This is the partition whose figures were just recomputed.
                 uint updateFrame = SimulationUtils.GetUpdateFrame(
                     _simulationSystem.frameIndex, CompanyUpdatesPerDay, UpdatePartitions);
-                int partition = (int)(updateFrame % UpdatePartitions);
 
                 if (session.Role == SessionRole.Host)
                 {
                     DropIncomingPages();
-                    ScanHostChanges(partition);
+                    int partition;
+                    if (_hostScanCadence.TryTakePartition(_simulationSystem.selectedSpeed,
+                            UpdatePartitions, out partition))
+                        ScanHostChanges(partition);
                 }
                 else
                 {
@@ -412,17 +415,7 @@ namespace CS2MPMod.Game.Sync.Systems
 
         internal void Enqueue(CompanyStatsSnapshot snapshot)
         {
-            if (snapshot == null) return;
-            lock (_incoming)
-            {
-                _incoming.Enqueue(snapshot);
-                while (_incoming.Count > MaxIncomingPages)
-                {
-                    CompanyStatsSnapshot dropped;
-                    if (!_incoming.TryDequeue(out dropped)) break;
-                    _droppedPages++;
-                }
-            }
+            if (snapshot != null) _droppedPages += _propertyState.Enqueue(snapshot);
         }
 
         internal void ResetPending()
@@ -431,7 +424,7 @@ namespace CS2MPMod.Game.Sync.Systems
             MultiplayerService service = Mod.Service;
             if (service != null && service.Session.Role == SessionRole.Client)
                 ApplyLocalAuthority(service.Session);
-            else if (service == null || !service.GameplaySyncReady)
+            else if (service == null || !service.SimulationSyncReady)
                 RestoreLocalAuthority();
         }
 
@@ -447,6 +440,9 @@ namespace CS2MPMod.Game.Sync.Systems
             PropertyRentIdentity discardedPriority;
             while (_priorityOrder.TryDequeue(out discardedPriority)) { }
             _hostObserved.Clear();
+            _hostScanCadence.Reset();
+            _stateScanCadence.Reset();
+            _tenancyScanCadence.Reset();
             _hostEmployeeObserved.Clear();
             _hostEfficiencyObserved.Clear();
             _clientEfficiencyObserved.Clear();
@@ -464,6 +460,7 @@ namespace CS2MPMod.Game.Sync.Systems
             _stateRetries.Clear();
             _clientEmployeeObserved.Clear();
             _stateRetryScratch.Clear();
+            _stateAppliedThisBoundary.Clear();
             _tenancyOrder.Clear();
             _tenancyCursor = 0;
             _stateCursor = 0;
@@ -480,6 +477,9 @@ namespace CS2MPMod.Game.Sync.Systems
             _desiredEmployeeEntities.Clear();
             _employeeEntityScratch.Clear();
             _employeeRemovalScratch.Clear();
+            _employeeRemovalMembers.Clear();
+            _partialEmployeeStates.Clear();
+            _partialEmployeeSeen.Clear();
             _commercialBucket.Clear();
             _industrialBucket.Clear();
             _officeBucket.Clear();

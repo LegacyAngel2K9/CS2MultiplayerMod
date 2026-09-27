@@ -1,8 +1,7 @@
 using System;
-using System.IO;
-using CS2MPMod.Core.Protocol;
+using CS2MultiplayerMod.Core.Protocol;
 
-namespace CS2MPMod.Core.Session
+namespace CS2MultiplayerMod.Core.Session
 {
     /// <summary>
     /// Accumulates the chunks of one incoming blob until the final chunk arrives, then
@@ -14,18 +13,18 @@ namespace CS2MPMod.Core.Session
     /// </summary>
     internal sealed class BlobReassembler
     {
-        private MemoryStream _buffer = new MemoryStream();
-        private bool _completed;
+        private readonly byte[] _buffer;
 
         public BlobReassembler(int expectedBytes, long nowMs)
         {
-            if (expectedBytes <= 0) throw new ArgumentOutOfRangeException(nameof(expectedBytes));
+            if (expectedBytes <= 0) throw new ProtocolException("Invalid blob size.");
+            _buffer = new byte[expectedBytes];
             ExpectedBytes = expectedBytes;
             LastChunkAtMs = nowMs;
         }
 
         public int ExpectedBytes { get; }
-        public int ReceivedBytes { get { return _completed ? ExpectedBytes : (int)_buffer.Length; } }
+        public int ReceivedBytes { get; private set; }
         public int ChunkCount { get; private set; }
 
         /// <summary>When most recent chunk arrived - lets owner expire stalled transfers.</summary>
@@ -43,7 +42,6 @@ namespace CS2MPMod.Core.Session
         /// </summary>
         public void Append(int announcedTotal, byte[] data, long nowMs)
         {
-            if (_completed) throw new ProtocolException("Blob has already been completed.");
             if (announcedTotal != ExpectedBytes)
                 throw new ProtocolException("Blob total changed mid-transfer: " +
                                             ExpectedBytes + " -> " + announcedTotal + ".");
@@ -53,26 +51,16 @@ namespace CS2MPMod.Core.Session
                 throw new ProtocolException("Blob chunk of " + length + " bytes exceeds the " +
                                             ProtocolConstants.BlobChunkBytes + "-byte chunk cap.");
 
-            if (ChunkCount >= MaxChunks)
+            ChunkCount++;
+            if (ChunkCount > MaxChunks)
                 throw new ProtocolException("Blob exceeded its maximum of " + MaxChunks + " chunks.");
 
-            // Reject before MemoryStream grows or any transfer state is changed.
             if (length > ExpectedBytes - ReceivedBytes)
-                throw new ProtocolException("Blob chunk exceeds the remaining announced bytes.");
+                throw new ProtocolException("Blob received " + ReceivedBytes +
+                                            " bytes, more than the announced " + ExpectedBytes + ".");
 
-            if (length > 0)
-            {
-                int required = ReceivedBytes + length; // Validated against ExpectedBytes above.
-                if (required > _buffer.Capacity)
-                {
-                    // MemoryStream normally doubles without regard to the announced total.
-                    // Grow lazily, but never reserve more than this transfer can contain.
-                    long capacity = Math.Max(required, (long)_buffer.Capacity * 2);
-                    _buffer.Capacity = (int)Math.Min(ExpectedBytes, capacity);
-                }
-                _buffer.Write(data, 0, length);
-            }
-            ChunkCount++;
+            if (length > 0) Buffer.BlockCopy(data, 0, _buffer, ReceivedBytes, length);
+            ReceivedBytes += length;
             LastChunkAtMs = nowMs;
         }
 
@@ -82,18 +70,9 @@ namespace CS2MPMod.Core.Session
         /// </summary>
         public byte[] Complete()
         {
-            if (_completed) throw new ProtocolException("Blob has already been completed.");
             if (ReceivedBytes != ExpectedBytes)
                 throw new ProtocolException("Blob ended at " + ReceivedBytes + "/" + ExpectedBytes + " bytes.");
-            // Capacity is capped at ExpectedBytes during growth, so a complete buffer has
-            // exactly the required length. Transfer ownership without a full-size copy.
-            byte[] result = _buffer.GetBuffer();
-            if (result.Length != ExpectedBytes)
-                throw new ProtocolException("Completed blob buffer has an unexpected capacity.");
-            _completed = true;
-            _buffer.Dispose();
-            _buffer = null;
-            return result;
+            return _buffer;
         }
     }
 }

@@ -51,6 +51,10 @@ namespace CS2MPMod.Core.Session
         private readonly HashSet<ushort> _allowedCommandIds = new HashSet<ushort>();
         private readonly HashSet<int> _administrativeRemovals = new HashSet<int>();
         private readonly HashSet<string> _hostBannedAddresses = new HashSet<string>();
+        // Connections already told to go. The transport only removes a peer when its
+        // Disconnected event arrives, so without this every frame already queued behind a
+        // flood is dispatched - and logged - against a connection that is on its way out.
+        private readonly HashSet<int> _puntedConnections = new HashSet<int>();
         private readonly FailedAuthTracker _failedAuth = new FailedAuthTracker();
 
         private ITransport _transport;
@@ -86,6 +90,19 @@ namespace CS2MPMod.Core.Session
 
         /// <summary>True when hosting beyond the local network (LAN filter off).</summary>
         public bool PublicExposure => Role == SessionRole.Host && _config != null && !_config.LanOnly;
+
+        /// <summary>
+        /// Whether this session replicates the simulation's own decisions. The host answers from
+        /// its own config; a client answers with what the host announced when it was accepted,
+        /// never with its local setting - the two machines have to hold the same half of the
+        /// simulation or one of them waits forever for the other's messages.
+        /// </summary>
+        public bool SimulationSyncEnabled => Role == SessionRole.Client
+            ? _hostSimulationSync
+            : _config == null || _config.SimulationSync;
+
+        /// <summary>Client-only: the host's answer, defaulted until the accept arrives.</summary>
+        private bool _hostSimulationSync = true;
 
         /// <summary>How the active session reaches its peers (Direct before the first session).</summary>
         public TransportMode Transport => _config != null ? _config.Transport : TransportMode.Direct;
@@ -211,6 +228,7 @@ namespace CS2MPMod.Core.Session
                 ReapTimedOutPeers(nowUnixMs);
                 PumpCommandReplay(nowUnixMs);
                 SweepStalledBlobs(nowUnixMs);
+                PumpOutgoingBlobs();
                 UpdateOutgoingBlobProgress();
 
                 // The ban book only grows on failed auths, so a sparse sweep is plenty.
@@ -228,11 +246,15 @@ namespace CS2MPMod.Core.Session
             if (!_outgoingBlobActive || _transport == null) return;
 
             long pending = _transport.PendingSendBytes;
-            long sent = _outgoingBlobTotal - pending;
+            long remaining = 0;
+            foreach (OutgoingBlob blob in _outgoingBlobs) remaining += blob.Data.Length - blob.Offset;
+            long sent = _outgoingBlobTotal - remaining - pending;
             _outgoingBlobSent = sent < 0 ? 0 : (sent > _outgoingBlobTotal ? _outgoingBlobTotal : sent);
 
             // Drained to a trickle (only small keep-alives/commands left): the world is sent.
-            if (pending < 65536)
+            // Gameplay traffic keeps flowing, so waiting for an exactly empty queue would leave
+            // the transfer reported as active for the rest of the session.
+            if (_outgoingBlobs.Count == 0 && pending < 65536)
             {
                 _outgoingBlobSent = _outgoingBlobTotal;
                 _outgoingBlobActive = false;

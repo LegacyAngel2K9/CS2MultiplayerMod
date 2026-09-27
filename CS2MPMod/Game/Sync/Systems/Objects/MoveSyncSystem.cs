@@ -8,13 +8,13 @@ using Game.Tools;
 using Unity.Collections;
 using Unity.Entities;
 using Unity.Mathematics;
-using CS2MPMod.Core.Diagnostics;
-using CS2MPMod.Core.Protocol.Messages;
-using CS2MPMod.Core.Session;
-using CS2MPMod.Game.Diagnostics;
-using CS2MPMod.Game.Sync.Infrastructure;
-using CS2MPMod.Game.Sync.Commands;
-namespace CS2MPMod.Game.Sync.Systems
+using CS2MultiplayerMod.Core.Diagnostics;
+using CS2MultiplayerMod.Core.Protocol.Messages;
+using CS2MultiplayerMod.Core.Session;
+using CS2MultiplayerMod.Game.Diagnostics;
+using CS2MultiplayerMod.Game.Sync.Infrastructure;
+using CS2MultiplayerMod.Game.Sync.Commands;
+namespace CS2MultiplayerMod.Game.Sync.Systems
 {
     /// <summary>
     /// Replicates relocations. A simple free-standing object moves through one relocate definition;
@@ -233,7 +233,6 @@ namespace CS2MPMod.Game.Sync.Systems
                     SyncLog.Warn(LogTopic.Buildings,
                         "MoveSync: relocation target did not resolve within the retry " +
                         "window; dropping this move (use /sync if the city drifts).");
-                    OperationTrace.Observe(_blockedMove, "rejected", reason: "move-dependency-expired");
                     _hasBlockedMove = false;
                     _blockedMove = null;
                     return;
@@ -251,7 +250,6 @@ namespace CS2MPMod.Game.Sync.Systems
                 _hasBlockedMove = true;
                 _blockedMove = message;
                 _blockedMoveDeadline = now + MoveRetryWindowMs;
-                OperationTrace.Observe(message, "retry", reason: "move-dependency-or-commit-busy");
                 SyncLog.Trace(LogTopic.Buildings, "move target retrying");
                 return;
             }
@@ -266,11 +264,8 @@ namespace CS2MPMod.Game.Sync.Systems
                 // A malformed peer command is not local corruption; drop it, do not resync.
                 SyncLog.Warn(LogTopic.Buildings, "MoveSync: dropping malformed command: " +
                     ex.Message);
-                OperationTrace.Observe(message, "rejected", reason: "move-malformed");
                 return true;
             }
-
-            OperationTrace.Observe(message, "decoded", prefab: command.PrefabName);
 
             Entity prefab;
             if (!_prefabIndex.TryResolve(command.PrefabName,
@@ -309,23 +304,16 @@ namespace CS2MPMod.Game.Sync.Systems
                         command.OriginalRandomSeed,
                         command.DestinationAttachmentKnown &&
                         command.DestinationAttachKind != ObjectAttachKind.None,
-                        destinationParent, host) != Entity.Null)
-                {
-                    OperationTrace.Observe(message, "commit-unverified", prefab: command.PrefabName,
-                        reason: "move-existing-destination-unverified");
-                    return true;
-                }
+                        destinationParent, host) != Entity.Null) return true;
                 return false;
             }
             var rotation = new quaternion(command.RotX, command.RotY, command.RotZ, command.RotW);
             bool requiresCompleteLifecycle = RequiresCompleteLifecycle(original, prefab, command);
-            OperationTrace.Observe(message, "applying", prefab: command.PrefabName);
             if (requiresCompleteLifecycle && !command.DestinationAttachmentKnown)
             {
                 SyncLog.Warn(LogTopic.Buildings, "MoveSync: relocation of '" + command.PrefabName +
                     "' lacks an authoritative destination attachment; dropping it instead " +
                     "of detaching its owned/roadside graph.");
-                OperationTrace.Observe(message, "rejected", reason: "move-attachment-unknown");
                 return true;
             }
 
@@ -337,29 +325,23 @@ namespace CS2MPMod.Game.Sync.Systems
                 BuildSyncSystem.NativeDeriveResult derived = buildSync.TryDeriveObjectTransaction(
                     prefab, Entity.Null, original, destinationParent, newPos, rotation,
                     command.Elevation, command.ToolRandomSeed, "move " + command.PrefabName,
-                    () => { OperationTrace.Observe(retained, "retry", reason: "move-commit-lost");
-                        _incoming.Enqueue(retained); },
-                    () => ObserveMoveCommit(retained, original, prefab, host, destinationParent, command));
+                    () => _incoming.Enqueue(retained),
+                    () => buildSync.TrackRemoteBuilding(original, prefab, newPos, rotation,
+                        roadConnectionExpected: false, source: "relocated"));
                 if (derived == BuildSyncSystem.NativeDeriveResult.Busy) return false;
                 if (derived == BuildSyncSystem.NativeDeriveResult.Armed)
                 {
-                    OperationTrace.Observe(message, "armed");
                     _guard.Mark(MoveKey(command.PrefabName, newPos), now);
                     SyncLog.Detail(LogTopic.Buildings, "MoveSync realize: derived relocation of '" +
                         command.PrefabName + "' from player " + message.OriginPlayerId + ".");
                     return true;
                 }
-                if (derived == BuildSyncSystem.NativeDeriveResult.Failed)
-                {
-                    OperationTrace.Observe(message, "rejected", reason: "move-generation-failed");
-                    return true;
-                }
+                if (derived == BuildSyncSystem.NativeDeriveResult.Failed) return true;
 
                 // A root-only compatibility move would strand an owned graph or bypass attachment /
                 // transport-stop lifecycle events, so unsupported native derivation is a hard stop.
                 SyncLog.Warn(LogTopic.Buildings, "MoveSync: relocation of '" + command.PrefabName +
                     "' needs the game's object lifecycle generator; dropping this move.");
-                OperationTrace.Observe(message, "rejected", reason: "move-generator-unavailable");
                 return true;
             }
 
@@ -394,7 +376,6 @@ namespace CS2MPMod.Game.Sync.Systems
                     });
                     EntityManager.AddComponent<Updated>(definition);
                     EntityManager.AddComponent<Deleted>(definition);
-                OperationTrace.Observe(message, "submitted", reason: "move-definition-submitted");
                 SyncLog.Detail(LogTopic.Buildings, "MoveSync realize: moved '" + command.PrefabName +
                     "' from player " + message.OriginPlayerId + " to (" + newPos.x.ToString("F1") +
                     "," + newPos.z.ToString("F1") + ").");
@@ -405,32 +386,8 @@ namespace CS2MPMod.Game.Sync.Systems
                 // the world (the placer can /sync if the object looks out of place).
                 SyncLog.Error(LogTopic.Buildings, "MoveSync realize FAILED for '" +
                     command.PrefabName + "'; dropping this move: " + ex);
-                OperationTrace.Observe(message, "rejected", reason: "move-definition-failed");
             }
             return true;
-        }
-
-        private void ObserveMoveCommit(SimulationCommandMessage message, Entity original, Entity prefab,
-            Entity owner, Entity destinationParent, ObjectMoveCommand command)
-        {
-            // Verify the original identity, not an arbitrary nearby object. A recreated root or
-            // delayed transform remains unverified rather than falsely acknowledging a neighbour.
-            bool verified = IsMoveCandidate(original, owner) &&
-                EntityManager.GetComponentData<PrefabRef>(original).m_Prefab == prefab;
-            if (verified)
-            {
-                Transform actual = EntityManager.GetComponentData<Transform>(original);
-                var expectedPosition = new float3(command.NewX, command.NewY, command.NewZ);
-                var expectedRotation = new float4(command.RotX, command.RotY, command.RotZ, command.RotW);
-                verified = math.distancesq(actual.m_Position, expectedPosition) <= 0.01f &&
-                    math.min(math.lengthsq(actual.m_Rotation.value - expectedRotation),
-                        math.lengthsq(actual.m_Rotation.value + expectedRotation)) <= 0.0001f &&
-                    (!command.DestinationAttachmentKnown ||
-                        NetAttachment.GetNetParent(EntityManager, original) == destinationParent);
-            }
-            OperationTrace.Observe(message, verified ? "completed" : "commit-unverified",
-                prefab: command.PrefabName,
-                reason: verified ? "move-root-verified" : "move-commit-state-unverified");
         }
 
         private Entity FindAt(Entity prefab, float3 position, bool hasRandomSeed,

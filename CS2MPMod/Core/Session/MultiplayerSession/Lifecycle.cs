@@ -167,6 +167,7 @@ namespace CS2MPMod.Core.Session
                 Role = SessionRole.Client;
                 _challengeAnswered = false;
                 _awaitingHostApproval = false;
+                _hostSimulationSync = true;
                 EncryptionActive = config.UseEncryption;
 
                 var client = new TcpClientTransport(_log);
@@ -212,6 +213,7 @@ namespace CS2MPMod.Core.Session
             Role = SessionRole.Client;
             _challengeAnswered = false;
             _awaitingHostApproval = false;
+            _hostSimulationSync = true;
             EncryptionActive = true;
 
             _transport = relay.CreateClient(_log, config.JoinCode);
@@ -286,8 +288,11 @@ namespace CS2MPMod.Core.Session
 
             _peers.Clear();
             _administrativeRemovals.Clear();
+            _puntedConnections.Clear();
             _hostBannedAddresses.Clear();
             _blobs.Clear();
+            ClearOutgoingBlobs();
+            _completedBlobTransfers.Clear();
             _blobTransferIds.Clear();
             ClearBlobProgress();
             _outgoingBlobActive = false;
@@ -297,6 +302,7 @@ namespace CS2MPMod.Core.Session
             LocalPlayerId = 0;
             _nextPlayerId = HostPlayerId + 1;
             _awaitingHostApproval = false;
+            _hostSimulationSync = true;
             EncryptionActive = false;
             _worldSyncSuspended = false;
             _worldSyncEpoch = 0;

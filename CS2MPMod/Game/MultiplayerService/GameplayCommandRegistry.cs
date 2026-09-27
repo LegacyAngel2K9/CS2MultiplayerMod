@@ -1,7 +1,7 @@
-using CS2MPMod.Core.Session;
-using CS2MPMod.Game.Sync.Commands;
+﻿using CS2MultiplayerMod.Core.Session;
+using CS2MultiplayerMod.Game.Sync.Commands;
 
-namespace CS2MPMod.Game
+namespace CS2MultiplayerMod.Game
 {
     /// <summary>
     /// Single source of truth for gameplay commands accepted at the session boundary.
@@ -25,12 +25,16 @@ namespace CS2MPMod.Game
             VisualCustomizationCommand.Id, ColorPaletteCommand.Id,
             DisasterEventCommand.Id, EntityNameCommand.Id,
             GrowableLifecycleCommand.Id,
+            ModTypeTableCommand.Id, ModStateCommand.Id,
         };
 
         internal static void Register(MultiplayerSession session)
         {
             session.AllowCommands(AllowedCommandIds);
         }
+
+        /// <summary>A copy for callers that iterate the allow-list without being able to edit it.</summary>
+        internal static ushort[] CopyAllowedIds() => (ushort[])AllowedCommandIds.Clone();
 
         internal static string Name(ushort id)
         {
@@ -64,6 +68,8 @@ namespace CS2MPMod.Game
                 case DisasterEventCommand.Id: return "disaster-event";
                 case EntityNameCommand.Id: return "entity-name";
                 case GrowableLifecycleCommand.Id: return "growable-lifecycle";
+                case ModTypeTableCommand.Id: return "mod-type-table";
+                case ModStateCommand.Id: return "mod-state";
                 default: return "unknown";
             }
         }

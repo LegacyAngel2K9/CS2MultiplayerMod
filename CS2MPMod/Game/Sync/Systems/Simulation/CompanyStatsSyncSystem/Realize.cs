@@ -30,7 +30,7 @@ namespace CS2MPMod.Game.Sync.Systems
         internal void PumpIncoming()
         {
             MultiplayerService service = Mod.Service;
-            if (service == null || !service.GameplaySyncReady) return;
+            if (service == null || !service.SimulationSyncReady) return;
             if (service.Session.Role == SessionRole.Host)
             {
                 DropIncomingPages();
@@ -41,10 +41,10 @@ namespace CS2MPMod.Game.Sync.Systems
             bool retryDue = _pending.Count > 0 && now >= _nextPendingPumpMs;
             if (_incoming.IsEmpty && !retryDue) return;
 
-            ObjectSearch.Batch search = _objectSearch.BeginBatch();
-            var candidates = new NativeList<Entity>(16, Allocator.Temp);
-            try
+            using (var scope = new PropertySearchScope(_objectSearch))
             {
+                ObjectSearch.Batch search = scope.Batch;
+                NativeList<Entity> candidates = scope.Candidates;
                 DrainIncoming(now, search, candidates, MaxPumpPages);
                 if (retryDue)
                 {
@@ -52,20 +52,13 @@ namespace CS2MPMod.Game.Sync.Systems
                     _nextPendingPumpMs = now + ResolveRetryMs;
                 }
             }
-            finally
-            {
-                candidates.Dispose();
-            }
         }
 
         private void DrainIncoming(long now, ObjectSearch.Batch search,
             NativeList<Entity> candidates, int maxPages)
         {
-            CompanyStatsSnapshot snapshot;
-            int pages = 0;
-            while (pages < maxPages && _incoming.TryDequeue(out snapshot))
+            _propertyState.PumpPages(maxPages, snapshot =>
             {
-                pages++;
                 _receivedPages++;
                 if (_clientSweepId != snapshot.SweepId)
                 {
@@ -87,7 +80,7 @@ namespace CS2MPMod.Game.Sync.Systems
                     _clientNextPage = 0;
                     _clientSweepIntact = false;
                 }
-            }
+            });
         }
 
         private void ResolveOrPend(CompanyStatsEntry entry, uint sweepId, long now,
@@ -129,36 +122,19 @@ namespace CS2MPMod.Game.Sync.Systems
 
         private void RetryPending(long now, ObjectSearch.Batch search, NativeList<Entity> candidates)
         {
-            if (_pending.Count == 0) return;
-            int examined = 0;
-            PropertyRentIdentity identity;
-            while (examined++ < MaxPendingRetriesPerUpdate && _pendingOrder.TryDequeue(out identity))
-            {
-                PendingEntry pending;
-                if (!_pending.TryGetValue(identity, out pending)) continue;
-                if (pending.ExpiresMs <= now)
+            PropertyRetryPump.Pump(_pending, _pendingOrder, now,
+                MaxPendingRetriesPerUpdate,
+                value => value.ExpiresMs, value => value.NextAttemptMs,
+                (value, retry) => value.NextAttemptMs = retry,
+                value =>
                 {
-                    _pending.Remove(identity);
-                    _expired++;
-                    continue;
-                }
-                if (pending.NextAttemptMs > now)
-                {
-                    _pendingOrder.Enqueue(identity);
-                    continue;
-                }
-                bool ambiguous;
-                Entity property = ResolveProperty(pending.Entry, search, candidates, out ambiguous);
-                if (property != Entity.Null)
-                {
-                    Cache(property, pending.Entry, pending.SweepId);
-                    _pending.Remove(identity);
+                    bool ambiguous;
+                    Entity property = ResolveProperty(value.Entry, search, candidates, out ambiguous);
+                    if (property == Entity.Null) return false;
+                    Cache(property, value.Entry, value.SweepId);
                     _resolved++;
-                    continue;
-                }
-                pending.NextAttemptMs = now + ResolveRetryMs;
-                _pendingOrder.Enqueue(identity);
-            }
+                    return true;
+                }, () => _expired++);
         }
 
         /// <summary>
@@ -174,46 +150,14 @@ namespace CS2MPMod.Game.Sync.Systems
             ambiguous = false;
             Entity prefab;
             _prefabIndex.TryResolve(entry.PrefabName,
-                candidate => EntityManager.HasComponent<BuildingPropertyData>(candidate),
-                out prefab);
-
-            var anchor = new float3(entry.AnchorX, entry.AnchorY, entry.AnchorZ);
-            search.CollectNear(anchor, AnchorSearchRadius, candidates);
-            Entity exact = Entity.Null, nearest = Entity.Null;
-            float exactDistance = 0f, nearestDistance = 0f;
-            bool exactAmbiguous = false, nearestAmbiguous = false;
-            for (int i = 0; i < candidates.Length; i++)
-            {
-                Entity candidate = candidates[i];
-                if (!IsLiveWorkplaceProperty(candidate)) continue;
-                float distance = math.distancesq(
-                    EntityManager.GetComponentData<global::Game.Objects.Transform>(candidate)
-                        .m_Position.xz, anchor.xz);
-                if (distance > AnchorMatchDistance * AnchorMatchDistance) continue;
-                if (prefab != Entity.Null &&
-                    EntityManager.GetComponentData<PrefabRef>(candidate).m_Prefab == prefab)
-                    ConsiderCandidate(candidate, distance, ref exact, ref exactDistance,
-                        ref exactAmbiguous);
-                ConsiderCandidate(candidate, distance, ref nearest, ref nearestDistance,
-                    ref nearestAmbiguous);
-            }
-            if (exact != Entity.Null && !exactAmbiguous) return exact;
-            ambiguous = exact != Entity.Null ? exactAmbiguous : nearestAmbiguous;
-            return nearest != Entity.Null && !nearestAmbiguous ? nearest : Entity.Null;
-        }
-
-        private static void ConsiderCandidate(Entity candidate, float distance, ref Entity best,
-            ref float bestDistance, ref bool ambiguous)
-        {
-            if (best == Entity.Null || distance < bestDistance - AmbiguousDistanceEpsilon)
-            {
-                best = candidate;
-                bestDistance = distance;
-                ambiguous = false;
-                return;
-            }
-            if (math.abs(distance - bestDistance) <= AmbiguousDistanceEpsilon && candidate != best)
-                ambiguous = true;
+                candidate => EntityManager.Exists(candidate) &&
+                    EntityManager.HasComponent<BuildingPropertyData>(candidate), out prefab);
+            PropertyResolution result = PropertyEntityResolver.Resolve(EntityManager, search,
+                candidates, new float3(entry.AnchorX, entry.AnchorY, entry.AnchorZ),
+                AnchorSearchRadius, AnchorMatchDistance, AmbiguousDistanceEpsilon, prefab,
+                IsLiveWorkplaceProperty, PropertyPrefabPreference.ExactFirst);
+            ambiguous = result.Ambiguous;
+            return result.Entity;
         }
 
         private void Cache(Entity property, CompanyStatsEntry entry, uint sweepId)
@@ -336,7 +280,7 @@ namespace CS2MPMod.Game.Sync.Systems
         internal void ApplyClientStateBoundary()
         {
             MultiplayerService service = Mod.Service;
-            if (service == null || !service.GameplaySyncReady ||
+            if (service == null || !service.SimulationSyncReady ||
                 service.Session.Role != SessionRole.Client) return;
 
             PumpIncoming();
@@ -354,7 +298,7 @@ namespace CS2MPMod.Game.Sync.Systems
             get
             {
                 MultiplayerService service = Mod.Service;
-                return service != null && service.GameplaySyncReady &&
+                return service != null && service.SimulationSyncReady &&
                        service.Session.Role == SessionRole.Client && _cache.Count != 0;
             }
         }
@@ -364,7 +308,7 @@ namespace CS2MPMod.Game.Sync.Systems
             get
             {
                 MultiplayerService service = Mod.Service;
-                return service != null && service.GameplaySyncReady;
+                return service != null && service.SimulationSyncReady;
             }
         }
 
@@ -433,7 +377,7 @@ namespace CS2MPMod.Game.Sync.Systems
 
             CompanyStatsEfficiency[] wanted = entry.Efficiencies;
             int wantedCount = wanted == null ? 0 : wanted.Length;
-            DynamicBuffer<Efficiency> local = EntityManager.GetBuffer<Efficiency>(property);
+            var local = new BufferEdit<Efficiency>(EntityManager, property);
             bool changed = local.Length != wantedCount;
             if (!changed)
             {
@@ -474,12 +418,14 @@ namespace CS2MPMod.Game.Sync.Systems
             using (Diagnostics.SyncProfiler.Measure("Companies.StateBoundary"))
             {
                 _stateRetryScratch.Clear();
+                _stateAppliedThisBoundary.Clear();
                 int processed = _stateDirty.Count < MaxStateDirtyPerBoundary
                     ? _stateDirty.Count : MaxStateDirtyPerBoundary;
                 for (int i = 0; i < processed; i++)
                 {
                     Entity property = _stateDirty[i];
                     _stateDirtyMembers.Remove(property);
+                    _stateAppliedThisBoundary.Add(property);
                     if (ApplyCachedCompany(property)) _stateRetries.Remove(property);
                     else if (_cache.ContainsKey(property)) _stateRetryScratch.Add(property);
                 }
@@ -488,13 +434,20 @@ namespace CS2MPMod.Game.Sync.Systems
                     RetryStateDirty(_stateRetryScratch[i]);
                 _stateRetryScratch.Clear();
 
+                // Only the fallback walk is speed-normalized; new pages and retries above
+                // retain their native boundary and drain capacity.
+                if (!_stateScanCadence.TryRun(_simulationSystem.selectedSpeed)) return;
+
+                // A small cache must not wrap and apply the same company dozens of times.
+                int walkLimit = Math.Min(MaxStateWalkedPerBoundary, _tenancyOrder.Count);
                 int walked = 0;
-                while (walked < MaxStateWalkedPerBoundary && _tenancyOrder.Count > 0)
+                while (walked < walkLimit && _tenancyOrder.Count > 0)
                 {
                     if (_stateCursor >= _tenancyOrder.Count) _stateCursor = 0;
                     Entity property = _tenancyOrder[_stateCursor++];
                     walked++;
-                    if (!_cache.ContainsKey(property)) continue;
+                    if (!_stateAppliedThisBoundary.Add(property) ||
+                        !_cache.ContainsKey(property)) continue;
                     if (ApplyCachedCompany(property)) _stateRetries.Remove(property);
                     else RetryStateDirty(property);
                 }
@@ -824,40 +777,6 @@ namespace CS2MPMod.Game.Sync.Systems
             return resolved;
         }
 
-        /// <summary>
-        /// The goods on the shelves. This is the one part of the block that is not purely
-        /// displayed - what a business holds feeds its own selling, producing and delivery - so it
-        /// is written as an absolute statement and every resource the host did not report is
-        /// cleared, exactly as an absolute roster clears an absent household.
-        /// </summary>
-        private void ApplyResources(Entity company, CompanyStatsEntry entry)
-        {
-            if (!EntityManager.HasBuffer<global::Game.Economy.Resources>(company)) return;
-            CompanyStatsResource[] wanted = entry.Resources;
-            DynamicBuffer<global::Game.Economy.Resources> resources =
-                EntityManager.GetBuffer<global::Game.Economy.Resources>(company);
-
-            bool changed = false;
-            for (int i = 0; i < EconomyUtils.ResourceCount; i++)
-            {
-                Resource resource = EconomyUtils.GetResource(i);
-                int desired = 0;
-                if (wanted != null)
-                {
-                    for (int w = 0; w < wanted.Length; w++)
-                    {
-                        if (wanted[w].Index != i) continue;
-                        desired = wanted[w].Amount;
-                        break;
-                    }
-                }
-                if (EconomyUtils.GetResources(resource, resources) == desired) continue;
-                EconomyUtils.SetResources(resource, resources, desired);
-                changed = true;
-            }
-            if (changed) _correctedResources++;
-        }
-
         private void ApplyTradeCosts(Entity company, CompanyStatsEntry entry)
         {
             if (!EntityManager.HasBuffer<TradeCost>(company)) return;
@@ -986,87 +905,6 @@ namespace CS2MPMod.Game.Sync.Systems
             return allResolved;
         }
 
-        private bool ReconcileEmployeeBuffer(Entity company, bool absolute)
-        {
-            _employeeRemovalScratch.Clear();
-            DynamicBuffer<Employee> employees = EntityManager.GetBuffer<Employee>(company);
-            bool changed = false;
-            if (absolute)
-            {
-                for (int i = 0; i < employees.Length; i++)
-                {
-                    Entity citizen = employees[i].m_Worker;
-                    if (_desiredEmployeeEntities.Contains(citizen) ||
-                        _employeeRemovalScratch.Contains(citizen)) continue;
-                    _employeeRemovalScratch.Add(citizen);
-                }
-
-                bool same = employees.Length == _resolvedEmployeeScratch.Count;
-                if (same)
-                {
-                    for (int i = 0; i < employees.Length; i++)
-                    {
-                        if (employees[i].m_Worker == _resolvedEmployeeScratch[i].Citizen &&
-                            employees[i].m_Level == _resolvedEmployeeScratch[i].State.Level)
-                            continue;
-                        same = false;
-                        break;
-                    }
-                }
-                if (same) return false;
-
-                employees.Clear();
-                for (int i = 0; i < _resolvedEmployeeScratch.Count; i++)
-                {
-                    employees.Add(new Employee
-                    {
-                        m_Worker = _resolvedEmployeeScratch[i].Citizen,
-                        m_Level = _resolvedEmployeeScratch[i].State.Level,
-                    });
-                }
-                return true;
-            }
-
-            // Partial roster: update/add only the residents explicitly named by the host.
-            for (int i = 0; i < _resolvedEmployeeScratch.Count; i++)
-            {
-                ResolvedEmployee wanted = _resolvedEmployeeScratch[i];
-                int first = -1;
-                for (int e = 0; e < employees.Length; e++)
-                {
-                    if (employees[e].m_Worker != wanted.Citizen) continue;
-                    first = e;
-                    break;
-                }
-                if (first < 0)
-                {
-                    employees.Add(new Employee
-                    {
-                        m_Worker = wanted.Citizen,
-                        m_Level = wanted.State.Level,
-                    });
-                    changed = true;
-                    continue;
-                }
-                if (employees[first].m_Level != wanted.State.Level)
-                {
-                    employees[first] = new Employee
-                    {
-                        m_Worker = wanted.Citizen,
-                        m_Level = wanted.State.Level,
-                    };
-                    changed = true;
-                }
-                for (int e = employees.Length - 1; e > first; e--)
-                {
-                    if (employees[e].m_Worker != wanted.Citizen) continue;
-                    employees.RemoveAt(e);
-                    changed = true;
-                }
-            }
-            return changed;
-        }
-
         private void RemoveEmployeeReference(Entity workplace, Entity citizen)
         {
             if (workplace == Entity.Null || !EntityManager.Exists(workplace) ||
@@ -1147,7 +985,7 @@ namespace CS2MPMod.Game.Sync.Systems
 
             WorkProvider provider = EntityManager.GetComponentData<WorkProvider>(company);
             WorkplaceData workplace = EntityManager.GetComponentData<WorkplaceData>(companyPrefab);
-            DynamicBuffer<Employee> employees = EntityManager.GetBuffer<Employee>(company);
+            DynamicBuffer<Employee> employees = EntityManager.GetBuffer<Employee>(company, true);
             FreeWorkplaces free = EntityManager.GetComponentData<FreeWorkplaces>(company);
             free.Refresh(employees, provider.m_MaxWorkers, workplace.m_Complexity, level);
             EntityManager.SetComponentData(company, free);
@@ -1192,8 +1030,11 @@ namespace CS2MPMod.Game.Sync.Systems
             PruneSettling();
 
             int created = 0, retired = 0;
+            // A district can dirty thousands of settled properties without creating a single
+            // company. Structural ceilings alone do not bound that comparison workload.
+            int dirtyLimit = Math.Min(MaxTenancyDirtyPerBoundary, _dirty.Count);
             int processed = 0;
-            while (processed < _dirty.Count &&
+            while (processed < dirtyLimit &&
                    (created < MaxCompaniesCreatedPerUpdate ||
                     retired < MaxCompaniesRetiredPerUpdate))
             {
@@ -1206,8 +1047,10 @@ namespace CS2MPMod.Game.Sync.Systems
             if (created >= MaxCompaniesCreatedPerUpdate && retired >= MaxCompaniesRetiredPerUpdate)
                 return;
 
+            if (!_tenancyScanCadence.TryRun(_simulationSystem.selectedSpeed)) return;
+            int walkLimit = Math.Min(MaxTenancyWalkedPerUpdate, _tenancyOrder.Count);
             int walked = 0;
-            while (walked < MaxTenancyWalkedPerUpdate && _tenancyOrder.Count > 0 &&
+            while (walked < walkLimit && _tenancyOrder.Count > 0 &&
                    (created < MaxCompaniesCreatedPerUpdate ||
                     retired < MaxCompaniesRetiredPerUpdate))
             {

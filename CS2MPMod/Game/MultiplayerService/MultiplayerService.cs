@@ -1,12 +1,12 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
-using CS2MPMod.Core.Diagnostics;
-using CS2MPMod.Core.Protocol.Messages;
-using CS2MPMod.Core.Session;
-using CS2MPMod.Game.Diagnostics;
+using CS2MultiplayerMod.Core.Diagnostics;
+using CS2MultiplayerMod.Core.Protocol.Messages;
+using CS2MultiplayerMod.Core.Session;
+using CS2MultiplayerMod.Game.Diagnostics;
 
-namespace CS2MPMod.Game
+namespace CS2MultiplayerMod.Game
 {
     /// <summary>
     /// Where a joining client stands in the world-handover flow. Gameplay sync is
@@ -67,14 +67,11 @@ namespace CS2MPMod.Game
         private ushort _lastLoggedCommandId;
         private long _lastCommandLogMs;
         private long _lastCommandLoggedTotal;
-        private long _lastCommandSequence;
 
         public MultiplayerService(IModLogger log)
         {
             _log = log;
             _session = new MultiplayerSession(log);
-            _session.StoreDiagnosticReport = ReceiveDiagnosticReport;
-            _session.DiagnosticReportAcknowledged = AcknowledgeDiagnosticReport;
             _session.AddObserver(new ServiceObserver(this));
 
             // Security allow-lists (secure by default in the core): the one blob channel
@@ -114,8 +111,22 @@ namespace CS2MPMod.Game
             ModEnabled &&
             _session.Status == SessionStatus.Connected &&
             !_worldSyncBarrierActive &&
-            !_session.CommandRecoveryPending &&
             (_session.Role == SessionRole.Host || _phase == ClientWorldPhase.InSession);
+
+        /// <summary>
+        /// Whether the host chose to replicate the simulation's own decisions this session -
+        /// zone-grown buildings, their occupants and tenants, and the demand behind them. The
+        /// host answers from its setting; a client answers with what the host announced when it
+        /// was accepted. Player edits do not consult this at all.
+        /// </summary>
+        public bool SimulationSyncEnabled => _session.SimulationSyncEnabled;
+
+        /// <summary>
+        /// <see cref="GameplaySyncReady"/> for the simulation half of the mod. Off, those systems
+        /// take the same branch a closed session takes: they drain what is queued and hand the
+        /// native simulation back the systems they were holding, so each city grows its own.
+        /// </summary>
+        public bool SimulationSyncReady => GameplaySyncReady && _session.SimulationSyncEnabled;
 
         internal string CommandDiagnosticSnapshot(long nowMs)
         {
@@ -138,7 +149,6 @@ namespace CS2MPMod.Game
             _appliedCommandTotal++;
             _lastAppliedCommandId = command.CommandId;
             _lastAppliedCommandOrigin = command.OriginPlayerId;
-            _lastCommandSequence = command.Sequence;
             _lastAppliedCommandBytes = command.Body != null ? command.Body.Length : 0;
             _lastAppliedCommandMs = now;
 
@@ -154,15 +164,14 @@ namespace CS2MPMod.Game
             _lastLoggedCommandId = command.CommandId;
             _lastCommandLogMs = now;
             _lastCommandLoggedTotal = _appliedCommandTotal;
-            SyncLog.Trace(LogTopic.Session, "command-received name=" + CommandName(command.CommandId) +
+            SyncLog.Trace(LogTopic.Session, "command-apply name=" + CommandName(command.CommandId) +
                 " id=" + command.CommandId + " origin=" + command.OriginPlayerId + " tick=" +
-                command.Tick + " sequence=" + command.Sequence + " bytes=" + _lastAppliedCommandBytes + " sinceLast=" +
+                command.Tick + " bytes=" + _lastAppliedCommandBytes + " sinceLast=" +
                 commandsSinceLog + " total=" + _appliedCommandTotal);
         }
 
         private void ResetCommandDiagnostics()
         {
-            OperationTrace.Reset();
             _appliedCommandTotal = 0;
             _lastAppliedCommandId = 0;
             _lastAppliedCommandOrigin = 0;
@@ -171,7 +180,6 @@ namespace CS2MPMod.Game
             _lastLoggedCommandId = 0;
             _lastCommandLogMs = 0;
             _lastCommandLoggedTotal = 0;
-            _lastCommandSequence = 0;
         }
 
         private static string CommandName(ushort id)
@@ -200,8 +208,7 @@ namespace CS2MPMod.Game
         /// settings button call <see cref="RequestWorldSync"/> directly.
         /// </summary>
         private const long AutoRecoveryCooldownMs = 90000;
-        private readonly Core.Sync.DeferredRecovery<Diagnostics.ResyncReport> _automaticRecovery =
-            new Core.Sync.DeferredRecovery<Diagnostics.ResyncReport>(AutoRecoveryCooldownMs);
+        private long _lastAutoRecoveryMs = long.MinValue;
 
         /// <summary>True while a world reload is already under way, in either role.</summary>
         private bool WorldRecoveryInFlight =>
@@ -241,7 +248,7 @@ namespace CS2MPMod.Game
             Diagnostics.SyncLog.Warn(LogTopic.Session,
                 "World sync: asking the host to stream this city again - the previous handover " +
                 "resumed before the snapshot had been installed.");
-            _session.RequestWorldSync("resume arrived before the snapshot finished loading");
+            _session.RequestAutomaticWorldSync("resume arrived before the snapshot finished loading");
         }
 
         /// <summary>
@@ -293,12 +300,7 @@ namespace CS2MPMod.Game
         /// </summary>
         private void PumpMaturedResyncReports()
         {
-            if (_session == null || _session.Status != SessionStatus.Connected)
-            {
-                _automaticRecovery.Reset();
-                _settledReport = null;
-                return;
-            }
+            if (_session == null || _session.Status != SessionStatus.Connected) return;
             // A reload already running supersedes anything held: leave the evidence alone rather
             // than announcing a verdict on it that nothing is going to act on.
             if (WorldRecoveryInFlight) return;
@@ -310,27 +312,33 @@ namespace CS2MPMod.Game
 
             System.Collections.Generic.List<Diagnostics.ResyncReport> matured =
                 Diagnostics.ResyncArbiter.TakeMatured(NowMs);
+            if (matured == null || matured.Count == 0) return;
             // One reload settles every one of them; the rest are folded into it.
-            if (matured != null && matured.Count > 0) RunAutomaticWorldRecovery(matured[0]);
-            PumpAutomaticWorldRecovery();
+            RunAutomaticWorldRecovery(matured[0]);
         }
 
         private void RunAutomaticWorldRecovery(Diagnostics.ResyncReport report)
         {
-            if (_automaticRecovery.Enqueue(report))
-                Diagnostics.SyncLog.Event(LogTopic.Session,
-                    "World sync: queued automatic recovery; rate limit remains " +
-                    (AutoRecoveryCooldownMs / 1000) + " s (" + report.Summary() + ").");
-            PumpAutomaticWorldRecovery();
-        }
-
-        private void PumpAutomaticWorldRecovery()
-        {
-            Diagnostics.ResyncReport report;
-            if (!_automaticRecovery.TryAttempt(NowMs, WorldRecoveryInFlight, out report)) return;
+            long now = NowMs;
+            // Guard the sentinel before subtracting it. `now - long.MinValue` wraps negative in
+            // unchecked arithmetic, which otherwise makes the first automatic recovery look as if
+            // it were inside the cooldown forever.
+            bool coolingDown = _lastAutoRecoveryMs != long.MinValue &&
+                               now - _lastAutoRecoveryMs < AutoRecoveryCooldownMs;
+            if (coolingDown)
+            {
+                Diagnostics.SyncLog.Warn(LogTopic.Session,
+                    "World sync: skipped a second automatic reload within " +
+                    (AutoRecoveryCooldownMs / 1000) + " s (" + report.Summary() +
+                    "). The edit behind it is left un-synced; use /sync if the city looks out of step.");
+                return;
+            }
+            _lastAutoRecoveryMs = now;
             Diagnostics.SyncLog.Event(LogTopic.Session,
-                "World sync: requesting repair from the host (" + report.Summary() + ").");
-            _session.RequestWorldSync(report.Reason);
+                "World sync: reloading this city from the host now (" + report.Summary() + ").");
+            // Include the subject in the existing bounded reason field: host-only logs must
+            // identify which inbox/operation failed on the client.
+            _session.RequestAutomaticWorldSync(report.Reason + " [" + report.Subject + "]");
         }
 
         // ---- Chat log (in-game hub panel) --------------------------------------
@@ -425,43 +433,6 @@ namespace CS2MPMod.Game
             public string Time;
         }
 
-        // ---- Map (savegame) sync ---------------------------------------------
-
-        /// <summary>Default and lower bound for the periodic world re-stream, in minutes.</summary>
-        private const int DefaultResyncMinutes = 15;
-        private const int MinResyncMinutes = 5;
-
-        private bool _warnedResyncMinutes;
-
-        /// <summary>
-        /// How often the host re-streams its world as a drift-correcting safety net.
-        ///
-        /// A world re-sync saves, streams and (on every client) reloads the whole city, so an
-        /// interval far below the default is punishing. <c>int.TryParse</c> zeroes its out
-        /// parameter on failure, so an unparseable box ("", "15m", "off") or a "0" meant to
-        /// disable the feature must not fall through to a clamp of 1 - that produced a full
-        /// save+stream+reload every single minute.
-        /// </summary>
-        public long ResyncIntervalMs
-        {
-            get
-            {
-                string raw = Mod.Setting != null ? (Mod.Setting.ResyncMinutes ?? "").Trim() : "";
-
-                int minutes;
-                if (!int.TryParse(raw, out minutes) || minutes <= 0) minutes = DefaultResyncMinutes;
-                else if (minutes < MinResyncMinutes) minutes = MinResyncMinutes;
-
-                if (!_warnedResyncMinutes && minutes.ToString() != raw)
-                {
-                    _warnedResyncMinutes = true;
-                    _log.Warn(LogTopic.Session, "World re-sync interval '" + raw +
-                        "' is not a whole number of minutes >= " + MinResyncMinutes + "; using " +
-                        minutes + " minutes instead.");
-                }
-                return (long)minutes * 60000L;
-            }
-        }
 
 
 
@@ -479,8 +450,6 @@ namespace CS2MPMod.Game
 
             public override void OnStatusChanged(SessionStatus status, string detail)
             {
-                if (status == SessionStatus.Offline || status == SessionStatus.Faulted)
-                    _service.FinishDiagnosticReport();
                 _log.Detail(LogTopic.Session, status + ": " + detail);
                 // Players commonly attach the flight log to a public support post. Keep
                 // the target IP/hostname in the private main log, but retain the port and
@@ -580,7 +549,6 @@ namespace CS2MPMod.Game
             }
             public override void OnCommandReceived(SimulationCommandMessage command)
             {
-                OperationTrace.Observe(command, "received");
                 _service.RecordAppliedCommand(command);
             }
             public override void OnPlayerStateReceived(PlayerStateMessage state) => _service.RecordRemotePlayer(state);
@@ -614,6 +582,8 @@ namespace CS2MPMod.Game
         public float EyeY;
         public float EyeZ;
         public float Yaw;
+        public Core.Protocol.Messages.PlayerHoverShape[] Hover =
+            System.Array.Empty<Core.Protocol.Messages.PlayerHoverShape>();
         public long LastUpdateMs;
     }
 }

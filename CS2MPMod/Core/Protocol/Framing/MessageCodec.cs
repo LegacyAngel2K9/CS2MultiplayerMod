@@ -38,7 +38,7 @@ namespace CS2MPMod.Core.Protocol
             codec.Register(MessageType.SimulationCommand, () => new SimulationCommandMessage(),
                 ProtocolConstants.MaxSimulationCommandPayloadBytes);
             codec.Register(MessageType.StateSnapshot, () => new StateSnapshotMessage(), 256 * 1024);
-            codec.Register(MessageType.PlayerState, () => new PlayerStateMessage(), 64);
+            codec.Register(MessageType.PlayerState, () => new PlayerStateMessage(), 34 + PlayerHoverShape.MaxShapes * PlayerHoverShape.WireSize);
             codec.Register(MessageType.BlobChunk, () => new BlobChunkMessage(),
                 ProtocolConstants.BlobChunkBytes + 1024);
             codec.Register(MessageType.StateEdit, () => new StateEditMessage(), 128 * 1024);
@@ -59,6 +59,10 @@ namespace CS2MPMod.Core.Protocol
                 throw new ArgumentOutOfRangeException(nameof(maxPayloadBytes));
             _entries[type] = new Entry { Factory = factory, MaxPayloadBytes = maxPayloadBytes };
         }
+
+        public bool AcceptsFrame(byte type, int length) =>
+            length > 0 && _entries.TryGetValue((MessageType)type, out Entry entry) &&
+            length <= entry.MaxPayloadBytes;
 
         public byte[] Encode(INetMessage message)
         {

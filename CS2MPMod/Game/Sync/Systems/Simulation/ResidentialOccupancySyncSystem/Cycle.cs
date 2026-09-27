@@ -46,7 +46,7 @@ namespace CS2MPMod.Game.Sync.Systems
         internal void ProcessHouseholdLifecycleBoundary()
         {
             MultiplayerService service = Mod.Service;
-            if (service == null || !service.GameplaySyncReady) return;
+            if (service == null || !service.SimulationSyncReady) return;
             if (service.Session.Role == SessionRole.Host)
                 ScanHostDepartures(service.NowMs);
             else
@@ -123,24 +123,14 @@ namespace CS2MPMod.Game.Sync.Systems
             MultiplayerService service = Mod.Service;
             if (service != null && service.Session.Role == SessionRole.Client)
                 ApplyLocalAuthority(service.Session);
-            else if (service == null || !service.GameplaySyncReady)
+            else if (service == null || !service.SimulationSyncReady)
                 RestoreLocalAuthority();
         }
 
         /// <summary>Called by the state channel on the receiving side; never requests a resync.</summary>
         internal void Enqueue(ResidentialOccupancySnapshot snapshot)
         {
-            if (snapshot == null) return;
-            lock (_incoming)
-            {
-                _incoming.Enqueue(snapshot);
-                while (_incoming.Count > MaxIncomingPages)
-                {
-                    ResidentialOccupancySnapshot dropped;
-                    if (!_incoming.TryDequeue(out dropped)) break;
-                    _droppedPages++;
-                }
-            }
+            if (snapshot != null) _droppedPages += _propertyState.Enqueue(snapshot);
         }
 
         internal void DrainForWorldChange()
@@ -149,6 +139,8 @@ namespace CS2MPMod.Game.Sync.Systems
             RestoreAllStagedTransferLinks();
             _cache.Clear();
             _appliedState.Clear();
+            _hostScanCadence.Reset();
+            _repairScanCadence.Reset();
             _reapplyRequested.Clear();
             _cacheScratch.Clear();
             _authorizedMoveAways.Clear();
@@ -180,6 +172,8 @@ namespace CS2MPMod.Game.Sync.Systems
             _bootstrapIdentityIndexBuilt = false;
             _unreachableSeen.Clear();
             _localHouseholds.Clear();
+            _localHouseholdMembers.Clear();
+            _reconciledHouseholdIds.Clear();
             _memberScratch.Clear();
             _claimedHouseholds.Clear();
             _claimedCitizens.Clear();
@@ -225,6 +219,7 @@ namespace CS2MPMod.Game.Sync.Systems
             ulong discardedTrackedCitizen;
             while (_hostCitizenOrder.TryDequeue(out discardedTrackedCitizen)) { }
             _hostHouseholds.Clear();
+            _hostRenterMembership.Reset();
             _hostHouseholdOrderMembers.Clear();
             ulong discardedTrackedHousehold;
             while (_hostHouseholdOrder.TryDequeue(out discardedTrackedHousehold)) { }
@@ -342,7 +337,9 @@ namespace CS2MPMod.Game.Sync.Systems
                     ", forcedCompletions=" + _forcedCompletions + ", prefabCorrections=" +
                     _forcedPrefabCorrections + ", deferredForConstruction=" +
                     _deferredForConstruction + ", economyCorrections=" + _economyCorrections +
-                    "/deferred " + _economyDeferred + ", feeInputs=" + _feeInputCorrections +
+                    "/deferred " + _economyDeferred + ", incomeCorrections=" +
+                    _incomeCorrections + "/deferred " + _incomeDeferred +
+                    ", feeInputs=" + _feeInputCorrections +
                     "/deferred " + _feeInputDeferred + ", pendingMoveIns=" +
                     _pendingMoveIns.Count +
                     ", dirty=" + _dirty.Count + ".");
@@ -361,6 +358,7 @@ namespace CS2MPMod.Game.Sync.Systems
             _forcedCompletions = _forcedPrefabCorrections = _alignedBuildRates = 0;
             _deferredForConstruction = 0;
             _renamedEntities = _economyCorrections = _economyDeferred = 0;
+            _incomeCorrections = _incomeDeferred = 0;
             _feeInputCorrections = _feeInputDeferred = 0;
         }
     }

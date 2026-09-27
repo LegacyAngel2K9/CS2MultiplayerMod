@@ -1,3 +1,4 @@
+using CS2MultiplayerMod.Game.Sync.Infrastructure;
 using System;
 using System.Collections.Generic;
 using CS2MPMod.Core.Diagnostics;
@@ -30,8 +31,9 @@ namespace CS2MPMod.Game.Sync.Systems
 
         private readonly Dictionary<Entity, LoadedWorldHouseholdRent> _loadedWorldHouseholdRents =
             new Dictionary<Entity, LoadedWorldHouseholdRent>();
-        private readonly List<Entity>[] _loadedWorldRentBuckets = CreateBuckets();
-        private readonly HashSet<Entity>[] _loadedWorldRentBucketMembers = CreateBucketSets();
+        private readonly PropertyPartitions _loadedRentPartitions = new PropertyPartitions();
+        private List<Entity>[] _loadedWorldRentBuckets => _loadedRentPartitions.Buckets;
+        private HashSet<Entity>[] _loadedWorldRentBucketMembers => _loadedRentPartitions.Members;
 
         private long _loadedWorldRentSeedGeneration;
         private bool _loadedWorldRentSeeded;
@@ -129,7 +131,7 @@ namespace CS2MPMod.Game.Sync.Systems
         internal void CorrectHouseholdRentsAfterRentAdjust(int bucket)
         {
             MultiplayerService service = Mod.Service;
-            if (service == null || !service.GameplaySyncReady ||
+            if (service == null || !service.SimulationSyncReady ||
                 service.Session.Role != SessionRole.Client ||
                 bucket < 0 || bucket >= UpdatePartitions) return;
 

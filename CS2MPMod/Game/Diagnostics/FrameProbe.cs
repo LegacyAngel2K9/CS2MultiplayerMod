@@ -1,7 +1,8 @@
 using System.Diagnostics;
-using CS2MPMod.Core.Diagnostics;
+using System.Globalization;
+using CS2MultiplayerMod.Core.Diagnostics;
 
-namespace CS2MPMod.Game.Diagnostics
+namespace CS2MultiplayerMod.Game.Diagnostics
 {
     /// <summary>
     /// Frame times, sampled from a system that runs once per rendered frame.
@@ -26,19 +27,38 @@ namespace CS2MPMod.Game.Diagnostics
         private static long _totalMs;
         private static int _frames;
         private static long _worstMs;
-        private static string _scope;
+        private static uint _lastSimulationFrame;
+        private static ulong _simulationTicks;
+        private static float _minimumSpeed, _maximumSpeed, _lastSpeed;
+        private static int _speedChanges;
 
         /// <summary>Call once per rendered frame while a session is live.</summary>
-        public static void Sample(string scope)
+        public static void Sample(float selectedSpeed, uint simulationFrame)
         {
-            if (_scope != scope) { Reset(); _scope = scope; }
             long now = Clock.ElapsedMilliseconds;
             if (_lastFrameMs < 0)
             {
                 _lastFrameMs = now;
                 _lastReportMs = now;
+                _lastSimulationFrame = simulationFrame;
+                _minimumSpeed = _maximumSpeed = _lastSpeed = selectedSpeed;
                 return;
             }
+
+            uint ticks = unchecked(simulationFrame - _lastSimulationFrame);
+            // World replacement can reset the simulation counter without resetting the UI world.
+            if (ticks > int.MaxValue)
+            {
+                Reset();
+                Sample(selectedSpeed, simulationFrame);
+                return;
+            }
+            _simulationTicks += ticks;
+            _lastSimulationFrame = simulationFrame;
+            if (selectedSpeed != _lastSpeed) _speedChanges++;
+            _lastSpeed = selectedSpeed;
+            if (selectedSpeed < _minimumSpeed) _minimumSpeed = selectedSpeed;
+            if (selectedSpeed > _maximumSpeed) _maximumSpeed = selectedSpeed;
 
             long frame = now - _lastFrameMs;
             _lastFrameMs = now;
@@ -59,8 +79,9 @@ namespace CS2MPMod.Game.Diagnostics
         public static void Reset()
         {
             SyncProfiler.Reset();
-            _scope = null;
             _lastFrameMs = -1;
+            _simulationTicks = 0;
+            _speedChanges = 0;
             _frames = 0;
             _totalMs = 0;
             _worstMs = 0;
@@ -72,9 +93,15 @@ namespace CS2MPMod.Game.Diagnostics
             long seconds = (now - _lastReportMs) / 1000;
             if (seconds <= 0) seconds = 1;
 
-            string line = "frameScope=" + _scope + " Frames/" + seconds + "s: " + _frames +
+            string line = "Frames/" + seconds + "s: " + _frames +
                           " (" + (_frames / seconds) + "/s, mean " + (_totalMs / _frames) +
-                          " ms, worst " + _worstMs + " ms) " + Histogram();
+                          " ms, worst " + _worstMs + " ms) " + Histogram() +
+                          " selectedSpeed=" + _minimumSpeed.ToString("0.##", CultureInfo.InvariantCulture) +
+                          ".." + _maximumSpeed.ToString("0.##", CultureInfo.InvariantCulture) +
+                          " speedChanges=" + _speedChanges +
+                          " simulationTicksPerSecond=" +
+                          (1000.0 * _simulationTicks / (now - _lastReportMs))
+                              .ToString("F1", CultureInfo.InvariantCulture);
 
             // Trace, not Detail: the flight log keeps both lines whether or not the switch is on,
             // because a performance report is exactly the case where the log was already captured
@@ -87,6 +114,9 @@ namespace CS2MPMod.Game.Diagnostics
             if (cost != null) SyncLog.Trace(LogTopic.Performance, cost);
 
             _lastReportMs = now;
+            _simulationTicks = 0;
+            _speedChanges = 0;
+            _minimumSpeed = _maximumSpeed = _lastSpeed;
             _frames = 0;
             _totalMs = 0;
             _worstMs = 0;

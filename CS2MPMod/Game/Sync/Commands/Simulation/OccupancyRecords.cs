@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Text;
 
-namespace CS2MPMod.Game.Sync.Commands
+namespace CS2MultiplayerMod.Game.Sync.Commands
 {
     // The records one occupancy page is made of: a property and the households, people and
     // departures it carries. Plain data - the page that carries them, and the validation each must
@@ -82,7 +82,10 @@ namespace CS2MPMod.Game.Sync.Commands
         public int AverageTaxRate;
         public int AverageTaxPaid;
 
-        /// <summary>Salary recorded by the host's household behavior pass for the last day.</summary>
+        /// <summary>
+        /// Daily household income the host's household behavior pass recomputed. Named
+        /// SalaryLastDay before game 1.6.2; same value, same wire slot.
+        /// </summary>
         public int Income;
 
         /// <summary>Consumption target produced by the host's household behavior pass.</summary>

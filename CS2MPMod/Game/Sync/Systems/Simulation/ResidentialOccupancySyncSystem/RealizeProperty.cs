@@ -1,3 +1,4 @@
+using CS2MultiplayerMod.Game.Sync.Infrastructure;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -201,6 +202,7 @@ namespace CS2MPMod.Game.Sync.Systems
             bool localUnderConstruction = ApplyConstruction(property, cached);
 
             CollectLocalHouseholds(property);
+            _reconciledHouseholdIds.Clear();
             _claimedHouseholds.Clear();
             _wantedHouseholdIds.Clear();
 
@@ -235,10 +237,14 @@ namespace CS2MPMod.Game.Sync.Systems
                 if (household == Entity.Null) continue;
                 _claimedHouseholds.Add(household);
 
-                if (!IsHouseholdAtProperty(household, property)) continue;
+                // Collection verified both renter links and removed duplicates. Reuse that
+                // membership instead of scanning the tower's renter buffer for every family.
+                if (!_localHouseholdMembers.Contains(household) &&
+                    !IsHouseholdAtProperty(household, property)) continue;
                 CancelUnauthorizedDeparture(household);
                 ApplyHousehold(household, property, desired);
                 NotePlacedHousehold(cached, desired, household);
+                _reconciledHouseholdIds.Add(desired.HouseholdId);
             }
 
             bool settling = IsSettling(property);
@@ -348,6 +354,9 @@ namespace CS2MPMod.Game.Sync.Systems
             for (int i = 0; i < wanted.Length; i++)
             {
                 OccupancyHousehold desired = wanted[i];
+                // Resident state was already applied above. Only outstanding move-ins need
+                // this second pass; replaying settled families doubles all their roster work.
+                if (_reconciledHouseholdIds.Contains(desired.HouseholdId)) continue;
                 if (desired.Departing) continue;
                 if (!IsHouseholdDesiredHere(desired.HouseholdId, property)) continue;
 
@@ -491,7 +500,8 @@ namespace CS2MPMod.Game.Sync.Systems
         private void CollectLocalHouseholds(Entity property)
         {
             _localHouseholds.Clear();
-            DynamicBuffer<Renter> renters = EntityManager.GetBuffer<Renter>(property);
+            _localHouseholdMembers.Clear();
+            var renters = new BufferEdit<Renter>(EntityManager, property);
             bool changed = false;
             for (int i = renters.Length - 1; i >= 0; i--)
             {
@@ -508,7 +518,7 @@ namespace CS2MPMod.Game.Sync.Systems
                 }
                 if (EntityManager.HasComponent<TouristHousehold>(renter) ||
                     EntityManager.HasComponent<CommuterHousehold>(renter)) continue;
-                if (_localHouseholds.Contains(renter))
+                if (!_localHouseholdMembers.Add(renter))
                 {
                     renters.RemoveAt(i);
                     changed = true;

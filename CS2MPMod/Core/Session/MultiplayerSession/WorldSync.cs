@@ -11,8 +11,12 @@ namespace CS2MPMod.Core.Session
         /// Host: atomically suspend gameplay traffic and send Begin to the exact peer set that
         /// will receive this snapshot. A peer joining later is intentionally not folded into a
         /// transfer whose causal cut is already being prepared.
+        ///
+        /// <paramref name="snapshotTargets"/> narrows who is actually sent a world; every other
+        /// target holds the barrier only. Null means every target receives one.
         /// </summary>
-        public bool BeginWorldSync(long epoch, float resumeSpeed, IList<ConnectionId> targets)
+        public bool BeginWorldSync(long epoch, float resumeSpeed, IList<ConnectionId> targets,
+            IList<ConnectionId> snapshotTargets = null)
         {
             if (Role != SessionRole.Host || Status != SessionStatus.Connected || epoch <= _lastWorldSyncEpoch ||
                 _worldSyncSuspended)
@@ -20,16 +24,26 @@ namespace CS2MPMod.Core.Session
 
             // A new barrier gets its own progress interval. Otherwise the completed percentage
             // from the previous snapshot would briefly appear while this one is still being saved.
+            ClearOutgoingBlobs();
             _outgoingBlobActive = false;
             _outgoingBlobTotal = 0;
             _outgoingBlobSent = 0;
             _worldSyncEpoch = epoch;
             _lastWorldSyncEpoch = epoch;
             _worldSyncSuspended = true;
-            var begin = new WorldSyncControlMessage(epoch, WorldSyncStage.Begin, resumeSpeed);
-            SendWorldSyncToTargets(begin, targets);
+            int barrierOnly = 0;
+            if (targets != null)
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    bool sendsWorld = snapshotTargets == null || snapshotTargets.Contains(targets[i]);
+                    if (!sendsWorld) barrierOnly++;
+                    SendWorldSyncTo(targets[i], new WorldSyncControlMessage(epoch,
+                        sendsWorld ? WorldSyncStage.Begin : WorldSyncStage.BeginBarrierOnly,
+                        resumeSpeed));
+                }
             _log.Event(LogTopic.WorldTransfer, "World sync epoch " + epoch + " began for " +
-                (targets != null ? targets.Count : 0) + " peer(s); gameplay traffic suspended.");
+                (targets != null ? targets.Count : 0) + " peer(s), " + barrierOnly +
+                " of them barrier-only; gameplay traffic suspended.");
             return true;
         }
 
@@ -71,6 +85,8 @@ namespace CS2MPMod.Core.Session
             if (Role != SessionRole.Host || !_worldSyncSuspended || epoch != _worldSyncEpoch)
                 return false;
 
+            ClearOutgoingBlobs();
+            _outgoingBlobActive = false;
             SendWorldSyncToTargets(
                 new WorldSyncControlMessage(epoch, WorldSyncStage.Abort, resumeSpeed), targets);
             _worldSyncSuspended = false;
@@ -92,11 +108,14 @@ namespace CS2MPMod.Core.Session
         {
             if (targets == null) return;
             for (int i = 0; i < targets.Count; i++)
-            {
-                Peer peer;
-                if (_peers.TryGetValue(targets[i].Value, out peer) && peer.Handshaked)
-                    SendTo(targets[i], message);
-            }
+                SendWorldSyncTo(targets[i], message);
+        }
+
+        private void SendWorldSyncTo(ConnectionId target, WorldSyncControlMessage message)
+        {
+            Peer peer;
+            if (_peers.TryGetValue(target.Value, out peer) && peer.Handshaked)
+                SendTo(target, message);
         }
 
         private void HandleWorldSyncControl(ConnectionId from, Peer peer,
@@ -128,7 +147,8 @@ namespace CS2MPMod.Core.Session
                 return;
             }
 
-            if (control.Stage == WorldSyncStage.Begin)
+            if (control.Stage == WorldSyncStage.Begin ||
+                control.Stage == WorldSyncStage.BeginBarrierOnly)
             {
                 if (!_worldSyncSuspended && control.Epoch <= _lastWorldSyncEpoch) return;
                 if (_worldSyncSuspended && control.Epoch < _worldSyncEpoch) return;

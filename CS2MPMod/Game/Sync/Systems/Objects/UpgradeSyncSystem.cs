@@ -8,13 +8,13 @@ using Game.Tools;
 using Unity.Collections;
 using Unity.Entities;
 using Unity.Mathematics;
-using CS2MPMod.Core.Diagnostics;
-using CS2MPMod.Core.Protocol.Messages;
-using CS2MPMod.Core.Session;
-using CS2MPMod.Game.Diagnostics;
-using CS2MPMod.Game.Sync.Infrastructure;
-using CS2MPMod.Game.Sync.Commands;
-namespace CS2MPMod.Game.Sync.Systems
+using CS2MultiplayerMod.Core.Diagnostics;
+using CS2MultiplayerMod.Core.Protocol.Messages;
+using CS2MultiplayerMod.Core.Session;
+using CS2MultiplayerMod.Game.Diagnostics;
+using CS2MultiplayerMod.Game.Sync.Infrastructure;
+using CS2MultiplayerMod.Game.Sync.Commands;
+namespace CS2MultiplayerMod.Game.Sync.Systems
 {
     /// <summary>
     /// Replicates service-building upgrades (<see cref="ServiceUpgrade"/>, <see cref="Extension"/>):
@@ -27,9 +27,6 @@ namespace CS2MPMod.Game.Sync.Systems
         private readonly ConcurrentQueue<SimulationCommandMessage> _incoming =
             new ConcurrentQueue<SimulationCommandMessage>();
         private readonly ReplicationGuard _guard = new ReplicationGuard();
-        private readonly CS2MPMod.Core.Sync.DeferredVerificationQueue _commitChecks =
-            new CS2MPMod.Core.Sync.DeferredVerificationQueue(64);
-        private long _commitCheckGeneration;
 
         /// <summary>An upgrade can outrun the building it attaches to; hold it until the owner exists.</summary>
         private const long OwnerRetryWindowMs = 10000;
@@ -37,8 +34,8 @@ namespace CS2MPMod.Game.Sync.Systems
         /// <summary>Ceiling on the wait list, so a peer can never grow it without bound.</summary>
         private const int MaxPendingOwners = 256;
 
-        private readonly System.Collections.Generic.List<(UpgradePlacementCommand cmd, SimulationCommandMessage message, long deadline)> _ownerRetry =
-            new System.Collections.Generic.List<(UpgradePlacementCommand, SimulationCommandMessage, long)>();
+        private readonly System.Collections.Generic.List<(UpgradePlacementCommand cmd, int origin, long deadline)> _ownerRetry =
+            new System.Collections.Generic.List<(UpgradePlacementCommand, int, long)>();
 
         private PrefabSystem _prefabSystem;
         private PrefabIndex _prefabIndex;
@@ -93,8 +90,6 @@ namespace CS2MPMod.Game.Sync.Systems
         {
             SyncInbox.Clear(_incoming);
             _ownerRetry.Clear();
-            _commitChecks.Clear();
-            _commitCheckGeneration++;
         }
 
         protected override void OnUpdate()
@@ -126,7 +121,6 @@ namespace CS2MPMod.Game.Sync.Systems
                 return;
             }
             long now = service.NowMs;
-            _commitChecks.Pump(now, 4);
             RealizeIncoming(session, now);
         }
 
@@ -215,11 +209,10 @@ namespace CS2MPMod.Game.Sync.Systems
             for (int i = _ownerRetry.Count - 1; i >= 0; i--)
             {
                 var pending = _ownerRetry[i];
-                if (TryRealize(pending.cmd, pending.message, now)) { _ownerRetry.RemoveAt(i); continue; }
+                if (TryRealize(pending.cmd, pending.origin, now)) { _ownerRetry.RemoveAt(i); continue; }
                 if (now >= pending.deadline)
                 {
                     _ownerRetry.RemoveAt(i);
-                    OperationTrace.Observe(pending.message, "rejected", reason: "upgrade-dependency-expired");
                     SyncLog.Warn(LogTopic.Buildings, "UpgradeSync realize: no local '" +
                         pending.cmd.OwnerPrefabName + "' after " + (OwnerRetryWindowMs / 1000) +
                         " s to attach '" + pending.cmd.PrefabName + "'; dropping.");
@@ -233,47 +226,33 @@ namespace CS2MPMod.Game.Sync.Systems
 
                 UpgradePlacementCommand command;
                 try { command = UpgradePlacementCommand.Decode(message.Body); }
-                catch (System.Exception ex) {
-                    OperationTrace.Observe(message, "rejected", reason: "upgrade-malformed");
-                    SyncLog.Warn(LogTopic.Buildings, "UpgradeSync: dropping malformed command: " + ex.Message); continue; }
+                catch (System.Exception ex) { SyncLog.Warn(LogTopic.Buildings, "UpgradeSync: dropping malformed command: " + ex.Message); continue; }
 
-                // Retain correlation only, not the encoded payload, through retries/callbacks.
-                var identity = new SimulationCommandMessage { Epoch = message.Epoch, Sequence = message.Sequence,
-                    OriginPlayerId = message.OriginPlayerId, CommandId = message.CommandId,
-                    Body = System.Array.Empty<byte>() };
-                if (TryRealize(command, identity, now)) continue;
+                if (TryRealize(command, message.OriginPlayerId, now)) continue;
 
                 // Its owner building may simply not have realized here yet — wait for it.
-                QueueOwnerRetry(command, identity, now);
+                QueueOwnerRetry(command, message.OriginPlayerId, now);
             }
         }
 
-        private void QueueOwnerRetry(UpgradePlacementCommand command, SimulationCommandMessage message, long now)
+        private void QueueOwnerRetry(UpgradePlacementCommand command, int origin, long now)
         {
-            if (_ownerRetry.Count >= MaxPendingOwners)
-            {
-                OperationTrace.Observe(_ownerRetry[0].message, "rejected", reason: "upgrade-retry-capacity");
-                _ownerRetry.RemoveAt(0);
-            }
-            OperationTrace.Observe(message, "retry", prefab: command.PrefabName, reason: "upgrade-dependency-or-commit-busy");
-            _ownerRetry.Add((command, message, now + OwnerRetryWindowMs));
+            if (_ownerRetry.Count >= MaxPendingOwners) _ownerRetry.RemoveAt(0);
+            _ownerRetry.Add((command, origin, now + OwnerRetryWindowMs));
         }
 
         /// <summary>
         /// Attempt one upgrade; false when its owner building is not (yet) local, so the caller can
         /// retry. An unknown prefab is a hard drop (returns true — nothing to wait for).
         /// </summary>
-        private bool TryRealize(UpgradePlacementCommand command, SimulationCommandMessage message, long now)
+        private bool TryRealize(UpgradePlacementCommand command, int origin, long now)
         {
-            int origin = message.OriginPlayerId;
-            OperationTrace.Observe(message, "decoded", prefab: command.PrefabName);
             Entity prefab, ownerPrefab;
             if (!_prefabIndex.TryResolve(command.PrefabName, out prefab) ||
                 !_prefabIndex.TryResolve(command.OwnerPrefabName, out ownerPrefab))
             {
                 SyncLog.Warn(LogTopic.Buildings, "UpgradeSync realize: unknown prefab '" +
                     command.PrefabName + "'/'" + command.OwnerPrefabName + "'; skipping.");
-                OperationTrace.Observe(message, "rejected", reason: "upgrade-prefab-unavailable");
                 return true;
             }
 
@@ -285,7 +264,6 @@ namespace CS2MPMod.Game.Sync.Systems
             {
                 SyncLog.Warn(LogTopic.Buildings, "UpgradeSync realize: '" + command.PrefabName +
                     "' is not a service upgrade; skipping.");
-                OperationTrace.Observe(message, "rejected", reason: "upgrade-prefab-invalid");
                 return true;
             }
 
@@ -299,12 +277,7 @@ namespace CS2MPMod.Game.Sync.Systems
             // Reliable retries and reconnect boundaries must not duplicate an already-realized
             // extension. Ownership is part of the identity because two nearby service buildings can
             // legitimately use the same upgrade prefab.
-            if (FindUpgrade(prefab, position, owner) != Entity.Null)
-            {
-                OperationTrace.Observe(message, "commit-unverified", reason: "upgrade-existing-unverified");
-                return true;
-            }
-            OperationTrace.Observe(message, "applying");
+            if (FindUpgrade(prefab, position, owner) != Entity.Null) return true;
 
             // Preferred path: let the game generate the transaction. It produces the host building's
             // re-commit, the road it attaches to, re-commits of the host's existing sub-nets with
@@ -312,51 +285,32 @@ namespace CS2MPMod.Game.Sync.Systems
             // the lot-surface snapping that makes the extension's own paths meet the street. None of
             // that is reproducible by creating the extension alone.
             UpgradePlacementCommand retained = command;
-            var chargeAttempt = new CS2MPMod.Core.Sync.VerifiedCommitEffect();
-            long checkGeneration = _commitCheckGeneration;
+            int retainedOrigin = origin;
             BuildSyncSystem.NativeDeriveResult derived = _buildSync.TryDeriveObjectTransaction(
                 prefab, owner, Entity.Null, Entity.Null, position, rotation, 0f,
                 command.ToolRandomSeed,
                 "upgrade " + command.PrefabName,
-                () => QueueOwnerRetry(retained, message, Mod.Service != null ? Mod.Service.NowMs : 0),
-                () =>
-                {
-                    if (checkGeneration != _commitCheckGeneration) return;
-                    bool verified = ObserveUpgradeCommit(message, prefab, owner, position, rotation);
-                    System.Action charge = () => chargeAttempt.TryApply(true,
-                        () => ConstructionCharger.ChargeUpgrade(EntityManager, prefab, command.PrefabName));
-                    if (verified) charge();
-                    else
-                    {
-                        var service = Mod.Service;
-                        long completedAt = service != null ? service.NowMs : now;
-                        if (!_commitChecks.Add(completedAt,
-                            () => ObserveUpgradeCommit(message, prefab, owner, position, rotation), charge))
-                            OperationTrace.Observe(message, "commit-unverified", reason: "upgrade-verification-capacity");
-                    }
-                });
+                () => QueueOwnerRetry(retained, retainedOrigin, Mod.Service != null ? Mod.Service.NowMs : 0),
+                null);
             if (derived == BuildSyncSystem.NativeDeriveResult.Busy) return false;
             if (derived == BuildSyncSystem.NativeDeriveResult.Armed)
             {
-                OperationTrace.Observe(message, "armed");
+                TrackRemoteUpgradeOwner(owner, ownerPrefab);
                 _guard.Mark(UpgradeKey(command.PrefabName, position), now);
+                ConstructionCharger.ChargeUpgrade(EntityManager, prefab, command.PrefabName);
                 SyncLog.Detail(LogTopic.Buildings, "UpgradeSync realize: derived '" +
                     command.PrefabName + "' on '" + command.OwnerPrefabName + "' from player " +
                     origin + ".");
                 return true;
             }
-            if (derived == BuildSyncSystem.NativeDeriveResult.Failed)
-            {
-                OperationTrace.Observe(message, "rejected", reason: "upgrade-generation-failed");
-                return true;
-            }
+            if (derived == BuildSyncSystem.NativeDeriveResult.Failed) return true;
 
             _guard.Mark(UpgradeKey(command.PrefabName, position), now);
             try
             {
+                TrackRemoteUpgradeOwner(owner, ownerPrefab);
                 RealizeUpgrade(prefab, owner, position, rotation,
                     EntityManager.GetComponentData<Transform>(owner), command.RandomSeed);
-                OperationTrace.Observe(message, "submitted", reason: "upgrade-definition-submitted");
                 ConstructionCharger.ChargeUpgrade(EntityManager, prefab, command.PrefabName);
                 SyncLog.Detail(LogTopic.Buildings, "UpgradeSync realize: attached '" +
                     command.PrefabName + "' to '" + command.OwnerPrefabName + "' from player " +
@@ -366,33 +320,22 @@ namespace CS2MPMod.Game.Sync.Systems
             {
                 SyncLog.Error(LogTopic.Buildings, "UpgradeSync realize FAILED for '" +
                     command.PrefabName + "': " + ex);
-                OperationTrace.Observe(message, "commit-unverified", reason: "upgrade-fallback-exception");
             }
             return true;
         }
 
-        private bool ObserveUpgradeCommit(SimulationCommandMessage message, Entity prefab, Entity owner,
-            float3 position, quaternion rotation)
+        private void TrackRemoteUpgradeOwner(Entity owner, Entity ownerPrefab)
         {
-            int matches = 0;
-            var candidates = _liveUpgrades.ToEntityArray(Allocator.Temp);
-            try
-            {
-                for (int i = 0; i < candidates.Length; i++)
-                {
-                    Entity candidate = candidates[i];
-                    if (EntityManager.GetComponentData<PrefabRef>(candidate).m_Prefab != prefab ||
-                        EntityManager.GetComponentData<Owner>(candidate).m_Owner != owner) continue;
-                    Transform actual = EntityManager.GetComponentData<Transform>(candidate);
-                    if (math.distancesq(actual.m_Position, position) <= 0.01f &&
-                        math.min(math.lengthsq(actual.m_Rotation.value - rotation.value),
-                            math.lengthsq(actual.m_Rotation.value + rotation.value)) <= 0.0001f) matches++;
-                }
-            }
-            finally { candidates.Dispose(); }
-            OperationTrace.Observe(message, matches == 1 ? "completed" : "commit-unverified",
-                reason: matches == 1 ? "upgrade-root-verified" : "upgrade-commit-state-unverified");
-            return matches == 1;
+            if (owner == Entity.Null || !EntityManager.Exists(owner) ||
+                EntityManager.HasComponent<Deleted>(owner) ||
+                !EntityManager.HasComponent<Building>(owner) ||
+                !EntityManager.HasComponent<Transform>(owner)) return;
+            Transform transform = EntityManager.GetComponentData<Transform>(owner);
+            Entity road = EntityManager.GetComponentData<Building>(owner).m_RoadEdge;
+            bool connectedRoad = road != Entity.Null && EntityManager.Exists(road) &&
+                                 !EntityManager.HasComponent<Deleted>(road);
+            _buildSync.TrackRemoteBuilding(owner, ownerPrefab, transform.m_Position,
+                transform.m_Rotation, connectedRoad, "upgrade owner");
         }
 
         private Entity FindOwner(Entity ownerPrefab, float3 ownerPos)

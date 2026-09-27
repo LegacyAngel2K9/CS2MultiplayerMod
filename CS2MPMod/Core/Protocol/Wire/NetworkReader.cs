@@ -1,7 +1,7 @@
 using System;
 using System.Text;
 
-namespace CS2MPMod.Core.Protocol
+namespace CS2MultiplayerMod.Core.Protocol
 {
     /// <summary>
     /// Counterpart to <see cref="NetworkWriter"/>. Reads little-endian primitives and
@@ -19,11 +19,8 @@ namespace CS2MPMod.Core.Protocol
         public NetworkReader(byte[] buffer, int offset, int count)
         {
             _buffer = buffer ?? throw new ArgumentNullException(nameof(buffer));
-            if (offset < 0 || offset > buffer.Length)
-                throw new ArgumentOutOfRangeException(nameof(offset));
-            // Subtract only after validating offset; offset + count could overflow.
-            if (count < 0 || count > buffer.Length - offset)
-                throw new ArgumentOutOfRangeException(nameof(count));
+            if (offset < 0 || offset > buffer.Length || count < 0 || count > buffer.Length - offset)
+                throw new ProtocolException("Invalid reader buffer range.");
             _position = offset;
             _end = offset + count;
         }

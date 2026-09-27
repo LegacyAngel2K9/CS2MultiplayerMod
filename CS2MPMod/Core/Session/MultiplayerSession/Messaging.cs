@@ -134,11 +134,16 @@ namespace CS2MPMod.Core.Session
         /// current world; on the host it refreshes every client. The actual save+stream
         /// is done by the observer (the game layer owns savegames).
         /// </summary>
-        public void RequestWorldSync(string reason = null)
+        public void RequestWorldSync() => RequestWorldSync(ManualSyncReason, false);
+
+        /// <summary>Recovery initiated by the mod, independently of a player's sync button.</summary>
+        public void RequestAutomaticWorldSync(string reason) => RequestWorldSync(reason, true);
+
+        private void RequestWorldSync(string reason, bool automatic)
         {
             if (Status != SessionStatus.Connected) return;
             reason = WireGuard.SanitizeText(reason, WireGuard.MaxResyncReasonLength);
-            if (reason.Length == 0) reason = ManualSyncReason;
+            if (reason.Length == 0) reason = automatic ? "automatic recovery" : ManualSyncReason;
             if (_worldSyncSuspended)
             {
                 _log.Detail(LogTopic.Session, "World sync request coalesced into active epoch " +
@@ -148,16 +153,23 @@ namespace CS2MPMod.Core.Session
 
             if (Role == SessionRole.Client)
             {
-                SendTo(ConnectionId.Server, new ResyncRequestMessage(LocalPlayerId, reason));
+                SendTo(ConnectionId.Server, new ResyncRequestMessage(LocalPlayerId, reason, automatic));
                 _log.Event(LogTopic.Session, "World sync request sent to host (" + reason + ").");
-                NotifyChat(null, "World sync requested - the host will stream you its city.");
+                NotifyChat(null, automatic
+                    ? "The mod requested an automatic world sync - the host will stream you its city."
+                    : "World sync requested - the host will stream you its city.");
             }
             else if (Role == SessionRole.Host)
             {
                 _log.Event(LogTopic.Session,
-                    "Host requested world sync for all clients (" + reason + ").");
+                    (automatic ? "Automatic world recovery started on host (" :
+                        "Host requested world sync for all clients (") + reason + ").");
+                string notice = automatic
+                    ? "The mod started an automatic world sync - streaming the city to all players."
+                    : "World sync started - streaming the city to all players.";
+                BroadcastToAll(new ChatMessage(null, notice), ConnectionId.None);
                 NotifyResyncRequested(LocalPlayerId, ConnectionId.None);
-                NotifyChat(null, "World sync started - streaming the city to all players.");
+                NotifyChat(null, notice);
             }
         }
 
@@ -166,21 +178,22 @@ namespace CS2MPMod.Core.Session
 
         private void HandleResyncRequest(ConnectionId from, Peer peer, long nowUnixMs)
         {
-            HandleResyncRequest(from, peer, nowUnixMs, ManualSyncReason);
+            HandleResyncRequest(from, peer, nowUnixMs, ManualSyncReason, false);
         }
 
-        private void HandleResyncRequest(ConnectionId from, Peer peer, long nowUnixMs, string reason)
+        private void HandleResyncRequest(ConnectionId from, Peer peer, long nowUnixMs, string reason,
+            bool automatic)
         {
             if (Role != SessionRole.Host) return;
 
             reason = WireGuard.SanitizeText(reason, WireGuard.MaxResyncReasonLength);
-            if (reason.Length == 0) reason = ManualSyncReason;
+            if (reason.Length == 0) reason = automatic ? "automatic recovery" : ManualSyncReason;
 
             // Rate limit: a misbehaving client spamming /sync would otherwise keep the
             // host in a permanent save+stream loop. (Per-peer budgets run on top.)
             if (nowUnixMs - _lastResyncAcceptedUnixMs < ResyncRequestCooldownMs)
             {
-                _log.Warn(LogTopic.Session, "Ignoring /sync from " +
+                _log.Warn(LogTopic.Session, "Ignoring world sync request from " +
                     (peer != null ? peer.ToString() : from.ToString()) + " (" + reason +
                     "): a world sync ran moments ago.");
                 return;
@@ -193,10 +206,13 @@ namespace CS2MPMod.Core.Session
             // Why the other machine gave up belongs in THIS log too. Without it the host's log
             // reads "someone asked for a sync" for both a player pressing the button and a client
             // pipeline that could not apply an edit - the two cases that need telling apart most.
-            _log.Event(LogTopic.Session, "World sync requested by " + name + ": " + reason + ".");
+            _log.Event(LogTopic.Session, (automatic ? "Automatic world recovery requested by the mod on " :
+                "World sync requested by ") + name + ": " + reason + ".");
 
             // Tell everyone the world is about to snap, then let the game layer stream it.
-            string notice = name + " requested a world sync.";
+            string notice = automatic
+                ? "The mod triggered an automatic world sync to recover synchronization."
+                : name + " requested a world sync.";
             BroadcastToAll(new ChatMessage(null, notice), ConnectionId.None);
             NotifyChat(null, notice);
             NotifyResyncRequested(peer != null ? peer.PlayerId : -1, from);
@@ -315,12 +331,16 @@ namespace CS2MPMod.Core.Session
             NotifyStateEdit(edit);
         }
 
-        /// <summary>Publish the local player's camera focus and eye position to the others.</summary>
-        public void SendPlayerState(float x, float y, float z, float eyeX, float eyeY, float eyeZ, float yaw)
+        /// <summary>Publish the local player's camera and display-only hover outlines.</summary>
+        public void SendPlayerState(float x, float y, float z, float eyeX, float eyeY, float eyeZ, float yaw,
+            PlayerHoverShape[] hover = null)
         {
             if (Status != SessionStatus.Connected || _worldSyncSuspended) return;
 
-            var message = new PlayerStateMessage(LocalPlayerId, x, y, z, eyeX, eyeY, eyeZ, yaw);
+            // Presence is refreshed at 10 Hz. Skip samples under backpressure instead of
+            // adding stale hover traffic behind city updates on the reliable stream.
+            if (_transport == null || _transport.PendingSendBytes > 16 * 1024) return;
+            var message = new PlayerStateMessage(LocalPlayerId, x, y, z, eyeX, eyeY, eyeZ, yaw, hover);
             if (Role == SessionRole.Host)
                 BroadcastToAll(message, ConnectionId.None);
             else
@@ -335,7 +355,7 @@ namespace CS2MPMod.Core.Session
                 state.PlayerId = peer.PlayerId;
 
             NotifyPlayerState(state);
-            if (Role == SessionRole.Host)
+            if (Role == SessionRole.Host && _transport != null && _transport.PendingSendBytes <= 16 * 1024)
                 BroadcastToAll(state, from); // fan a client's position out to the others
         }
 
