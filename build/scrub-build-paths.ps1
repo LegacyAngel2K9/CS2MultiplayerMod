@@ -3,7 +3,7 @@
 # Two sources leak them: the Burst native stubs, which embed the absolute path of
 # the toolchain's Burst cache, and their .pdb side files, which are never loaded at
 # runtime. Everything else (managed assembly, managed .pdb, UI bundle) is kept clean
-# by the compiler settings in CS2MultiplayerMod.csproj.
+# by the compiler settings in CS2MPMod.csproj.
 #
 # Byte replacement is length-preserving, so the surrounding binary layout is untouched.
 

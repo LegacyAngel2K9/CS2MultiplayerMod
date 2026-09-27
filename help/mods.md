@@ -71,7 +71,7 @@ Some display-only or UI-only mods may work. This list is not comprehensive - con
 and testing are welcome.
 
 Updated `2026-08-06` for version `v0.1.3`.
-[Current mod version](https://github.com/Rollocraft/CS2MultiplayerMod/blob/master/CS2MultiplayerMod/Properties/PublishConfiguration.xml#L31).
+[Current mod version](https://github.com/Rollocraft/CS2MPMod/blob/master/CS2MPMod/Properties/PublishConfiguration.xml#L31).
 
 ### Possibly compatible
 

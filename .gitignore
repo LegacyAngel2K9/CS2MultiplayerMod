@@ -10,18 +10,25 @@ Library/
 
 # UI module build artifacts
 node_modules/
-CS2MultiplayerMod/UI/build/
-CS2MultiplayerMod/UI/artifacts/
+CS2MPMod/UI/build/
+CS2MPMod/UI/artifacts/
+.dotnet-home/
+.npm-cache/
+build/local-userdata/
+build/last-build.log
+build/validation-build.log
+build/staging/
+build/packages/
 
 docs/
-tools/
+/tools/
 .claude/
 .idea
 CLAUDE.md
 Logs/
-tests/
 .mcp.json
 
 # MkDocs build output
 site/
 .venv/
+build/reports/

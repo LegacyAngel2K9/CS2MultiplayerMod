@@ -1,4 +1,16 @@
-Repo: https://github.com/Rollocraft/CS2MultiplayerMod
+Repo: https://github.com/Rollocraft/CS2MPMod
+
+## Local test build – 2026-09-17 – protocol 63
+
+- Fixed a missing first command permanently blocking client command dispatch.
+- Included the originating client in host sequence acknowledgements without replaying its own edit.
+- Added epoch validation and snapshot sequence baselines for resync and late join.
+- Bounded command history and pending memory; added multi-batch replay, retry deadlines and explicit unavailable-history recovery.
+- Preserved TCP disconnect notifications under data-queue pressure, with bounded retained admission slots.
+- Coalesced excess recovery requests instead of disconnecting solely for the resync quota.
+- Added 26 game-independent regression checks and a staging-only test-package builder.
+
+All peers must update together. In-game native placement and Steam integration still require multiplayer validation; build previews and targeted object repair are not part of this first patch.
 
 Newest Changelog and developments on Discord: https://discord.gg/KFZTW2YSJt
 
@@ -118,7 +130,7 @@ Happy Playing  🎉
 ## V 0.1.2
 V. 0.1.2  is out!
 
-We improved stability and fixed some bugs. Multiplayer is now more stable and less likely to crash. We also fixed the roundabout issue and improved sync in build mode. Thanks to all of you reporting Bugs and Crashes, this helps the development of the CS2 Multiplayer Mod!
+We improved stability and fixed some bugs. Multiplayer is now more stable and less likely to crash. We also fixed the roundabout issue and improved sync in build mode. Thanks to all of you reporting Bugs and Crashes, this helps the development of the CS2 MP Mod!
 
 Fixes:
 - Street Spam not lead to crash

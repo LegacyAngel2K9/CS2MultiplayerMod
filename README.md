@@ -1,4 +1,4 @@
-# CS2 Multiplayer Mod
+# CS2 MP Mod
 
 ## Introduction
 
@@ -10,7 +10,7 @@ The mod is **experimental**. Back up your saves before hosting or joining, and e
 
 ## Requirements
 
-- Cities: Skylines II (PC Version: Steam, XBox, Gamepass)
+- Cities: Skylines II **1.6.2f1** (PC Version: Steam, XBox, Gamepass). The current API integration targets this version (Household income and the 24-argument object generator). Local singleplayer smoke testing has passed; coordinated multiplayer validation remains in progress.
 - **All players should run the same version of the mod.** A host can allow a different build with the own-risk compatibility override, but incompatible network protocols are always rejected and mixed builds can desync or crash.
 - Players should also have **matching gameplay DLC**. Radio Station DLC are unaffected. Learn how to disable DLC: [Disabling DLC](help/disable_dlc.md)
 - There are **no** mods currently working.
@@ -49,11 +49,11 @@ Check out **[Troubleshooting](help/troubleshooting.md)** or the complete **[Erro
 ## Technical Details
 
 - The host is authoritative, and clients download the host's world when they join.
-- The mod checks for matching DLC and version numbers before letting users connect. Find a list of white-listed DLC [here](CS2MultiplayerMod/Game/DlcCheck.cs#L21-L32). 
+- The mod checks for matching DLC and version numbers before letting users connect. Find a list of white-listed DLC [here](CS2MPMod/Game/DlcCheck.cs#L21-L32). 
 
 ## Contributing & License
 
-This mod and its source code are licensed under the [CS2 Multiplayer Mod Non-Commercial License](LICENSE). The license allows personal use, modification, and contributions to this project, but it does not allow commercial use, paid redistribution, or publishing clones/rebranded forks as someone else's project.
+This mod and its source code are licensed under the [CS2 MP Mod Non-Commercial License](LICENSE). The license allows personal use, modification, and contributions to this project, but it does not allow commercial use, paid redistribution, or publishing clones/rebranded forks as someone else's project.
 
 Contributions are welcome as long as they follow this repository's license. Keep attribution intact, submit changes through this project, and do not publish paid, monetized, or rebranded copies of the mod.
 

@@ -1,0 +1,6 @@
+trace [pipeline] operation session=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa epoch=1 sequence=5 player=2 command=1 operation=99 prefab=PrivateAsset stage=received elapsedLocalMs=20 reason=C:\Users\PrivateUser\secret steam:76561198000000000 192.0.2.1 Alice
+trace [pipeline] operation schema=1 session=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa epoch=1 sequence=5 player=2 command=1 operation=99 stage=completed elapsedLocalMs=40 queueMs=10 applyMs=30 captureResult=unknown applyResult=verified-or-equivalent
+trace [pipeline] operation-summary session=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa player=2 received=5 completedObserved=5 pending=0 oldestPendingMs=0 evicted=0
+EVENT [session] private player Alice address=192.0.2.1 path=C:\Users\PrivateUser\secret
+trace [pipeline] operation session=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa epoch=1 sequence=6 player=2 stage=waiting-identity
+trace [pipeline] operation session=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa epoch=1 sequence=7 player=2 stage=commit-unverified reason=route-update-state-mismatch

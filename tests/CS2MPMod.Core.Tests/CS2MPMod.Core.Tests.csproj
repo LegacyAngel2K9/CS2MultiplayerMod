@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <NoWarn>$(NoWarn);SYSLIB0057;SYSLIB0039</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Compile the real game-independent implementation, without game DLLs or deployment. -->
+    <Compile Include="../../CS2MPMod/Core/**/*.cs" Link="Core/%(RecursiveDir)%(Filename)%(Extension)" />
+    <Compile Include="../../CS2MPMod/Game/Diagnostics/ResyncReport.cs" Link="Diagnostics/ResyncReport.cs" />
+    <Compile Include="../../CS2MPMod/Game/Diagnostics/ResyncArbiter.cs" Link="Diagnostics/ResyncArbiter.cs" />
+    <Compile Include="../../CS2MPMod/Game/Sync/Infrastructure/Pipeline/SyncInbox.cs" Link="Diagnostics/SyncInbox.cs" />
+  </ItemGroup>
+</Project>

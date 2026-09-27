@@ -1,0 +1,305 @@
+using System.Collections.Generic;
+using System.Text;
+using Colossal.Mathematics;
+using Game.Net;
+using Game.Prefabs;
+using Unity.Collections;
+using Unity.Entities;
+using Unity.Mathematics;
+using CS2MPMod.Core.Diagnostics;
+using CS2MPMod.Core.Session;
+using CS2MPMod.Game.Diagnostics;
+using CS2MPMod.Game.Sync.Infrastructure;
+using CS2MPMod.Game.Sync.Commands;
+namespace CS2MPMod.Game.Sync.Systems.Net
+{
+    // Capture (host) side of NetSyncSystem: detect the edges the local player drew, drop the
+    // side-effect halves of a mid-span split, broadcast the rest as NetPlacementCommands, and emit the
+    // periodic 5 s diagnostic summaries.
+    public partial class NetSyncSystem
+    {
+        private void RecordDiagnostic(string prefabName)
+        {
+            _diagTotal++;
+            int count;
+            _diag.TryGetValue(prefabName, out count);
+            _diag[prefabName] = count + 1;
+        }
+
+        private void FlushDiagnostics(long now)
+        {
+            if (_diagStartMs < 0) { _diagStartMs = now; return; }
+            if (now - _diagStartMs < 5000) return;
+
+            if (_diagTotal > 0)
+            {
+                var sb = new StringBuilder();
+                sb.Append("NetSync captured ").Append(_diagTotal)
+                  .Append(" road segment(s)/5s across ").Append(_diag.Count).Append(" prefab(s): ");
+                int n = 0;
+                foreach (var pair in _diag)
+                {
+                    if (n > 0) sb.Append(", ");
+                    sb.Append(pair.Key).Append(" x").Append(pair.Value);
+                    if (++n >= 12) { sb.Append(", ..."); break; }
+                }
+                SyncLog.Detail(LogTopic.Nets, sb.ToString());
+            }
+
+            if (_peakUpdated > 0 || _peakDeleted > 0 || _diagTotal > 0 || _capFilteredHalves > 0)
+            {
+                SyncLog.Detail(LogTopic.Nets, "NetSync edge tags/5s peak: Created=" + _peakCreated +
+                    " Updated=" + _peakUpdated + " Deleted=" + _peakDeleted + "; dropped " +
+                    _capFilteredHalves + " split-half edge(s) (side-effects of a " +
+                    "mid-span tap; only the drawn edge is sent so the receiver splits locally).");
+            }
+
+            if (_rzSegments > 0)
+            {
+                SyncLog.Detail(LogTopic.Nets, "NetSync realized " + _rzSegments +
+                    " remote segment(s)/5s; endpoints: " + _rzSnapEnds + " reused a node, " +
+                    _rzMergeEnds + " merged a shared new node, " + _rzMidEnds +
+                    " split an existing edge (T-junction), " + _rzFreeEnds + " free ground.");
+            }
+
+            if (_capPinnedSpans > 0 || _rzPinnedSpans > 0 || _rzPinRefused > 0 ||
+                _capSelfAnchoredSpans > 0 || _capBentDeckSpans > 0)
+            {
+                SyncLog.Detail(LogTopic.Nets, "NetSync water profile/5s: pinned " +
+                    _capPinnedSpans + " span(s) over water; left " + _capSelfAnchoredSpans +
+                    " banded by their own elevation and " + _capBentDeckSpans +
+                    " with a deck that is not one line to the receiver's own generator; realized " +
+                    _rzPinnedSpans + " pinned span(s), " + _rzPinRefused +
+                    " refused (those rebuild their deck from local water).");
+            }
+
+            if (_rzSurfaceCorrections > 0)
+            {
+                SyncLog.Detail(LogTopic.Nets, "NetSync: " + _rzSurfaceCorrections +
+                    " remote endpoint(s)/5s needed " + "an elevation correction (up to " +
+                    _rzSurfaceCorrectionMax.ToString("F1") + " m) because the surface under " +
+                    "them differs from the source's. The height is reproduced; a large or " +
+                    "growing figure means terrain or water is out of step.");
+            }
+
+            if (_rzLocalSurfaceMatches > 0)
+            {
+                SyncLog.Detail(LogTopic.Nets, "NetSync: " + _rzLocalSurfaceMatches +
+                    " utility endpoint(s)/5s reused connectivity through local-surface " +
+                    "height projection instead of creating an overlapping free node.");
+            }
+
+            _diag.Clear();
+            _diagTotal = 0;
+            _rzSegments = _rzSnapEnds = _rzMergeEnds = _rzMidEnds = _rzFreeEnds = 0;
+            _rzLocalSurfaceMatches = 0;
+            _capPinnedSpans = _capSelfAnchoredSpans = _capBentDeckSpans = 0;
+            _rzPinnedSpans = _rzPinRefused = 0;
+            _rzSurfaceCorrections = 0;
+            _rzSurfaceCorrectionMax = 0f;
+            _peakCreated = _peakUpdated = _peakDeleted = 0;
+            _capFilteredHalves = 0;
+            _diagStartMs = now;
+        }
+
+        /// <summary>
+        /// Send the pieces captured LAST frame that ride behind a replicated span delete - one frame
+        /// after it, so the receiver always bulldozes before it rebuilds (commands arrive in send order).
+        /// </summary>
+        private void FlushDeferredSpanPieces(MultiplayerSession session)
+        {
+            if (_deferredSpanPieces.Count == 0) return;
+            for (int i = 0; i < _deferredSpanPieces.Count; i++)
+            {
+                NetPlacementCommand command = _deferredSpanPieces[i];
+                session.SendCommand(0, NetPlacementCommand.Id, command.Encode());
+            }
+            _deferredSpanPieces.Clear();
+        }
+
+        private void CaptureNewEdges(MultiplayerSession session, long now)
+        {
+            // A local net-tool Apply was already serialized from its native NetCourse intent in
+            // ToolUpdate. Every Created edge in that operation (drawn courses, split halves and
+            // reductions) is output, not another placement command.
+            if (_nativeApplyCapturedFrame == _realizeFrame) return;
+
+            // Object-prefab networks (asset-stamp intersections, building driveways/connectors,
+            // etc.) are already carried inside one atomic ObjectToolOperationCommand. Replaying the
+            // resulting Created edges here discarded their shared graph and rebuilt them as many
+            // independent clicks: slow for large stamps and unreliable at tightly-spaced nodes.
+            BuildSyncSystem buildSync = World.GetExistingSystemManaged<BuildSyncSystem>();
+            if (buildSync != null && buildSync.NativeLifecycleCapturedThisFrame) return;
+
+            // On the frame a self-driven ApplyTool pass commits a remote batch, every Created edge
+            // here is that batch's output - skip exactly this frame (never a wall-clock window,
+            // which also swallowed roads the player built while remote batches streamed in).
+            if (_suppressCaptureThisFrame) return;
+            if (_createdEdges.IsEmptyIgnoreFilter) return;
+
+            // Snapshot this frame's Deleted edges. When the player taps a road mid-span, CS2 makes the
+            // T-junction by DELETING the existing edge and CREATING its two halves plus the drawn road
+            // (our logs: Created=3 Updated=1 Deleted=1). The halves are Created too, but they are a
+            // SIDE EFFECT of the split - not something the player drew. Replicating them makes the
+            // receiver re-split its own still-whole geometry destructively (roads vanish, the new road
+            // ends up disconnected). So below we drop any Created edge that is a true 3D sub-curve of a
+            // same-prefab Deleted edge (one of its halves) and send only the edge the player drew; the
+            // receiver reproduces the split locally via the Temp+ApplyTool realize path.
+            //
+            // NOT a local split: a span REBUILT at another height (the raise/lower gesture) or only
+            // PARTIALLY re-covered (something placed on top consumed the rest - a roundabout swallows
+            // the stretch inside its circle; the receiver's own split would keep it). For those the
+            // delete IS replicated (DeleteSyncSystem, same test on the same frame's data) and every
+            // kept piece is sent one frame behind it so the delete travels first.
+            NativeArray<Entity> delEnts = _deletedEdges.ToEntityArray(Allocator.Temp);
+            NativeArray<Curve> delCurves = _deletedEdges.ToComponentDataArray<Curve>(Allocator.Temp);
+            var delPrefabs = new NativeArray<Entity>(delEnts.Length, Allocator.Temp);
+            for (int i = 0; i < delEnts.Length; i++)
+                delPrefabs[i] = EntityManager.GetComponentData<PrefabRef>(delEnts[i]).m_Prefab;
+
+            NativeArray<Entity> entities = _createdEdges.ToEntityArray(Allocator.Temp);
+            NativeArray<Curve> createdCurves = _createdEdges.ToComponentDataArray<Curve>(Allocator.Temp);
+            var createdPrefabs = new NativeArray<Entity>(entities.Length, Allocator.Temp);
+            for (int i = 0; i < entities.Length; i++)
+                createdPrefabs[i] = EntityManager.GetComponentData<PrefabRef>(entities[i]).m_Prefab;
+
+            // Which deleted spans are rebuilt at another height or only partially re-covered: their
+            // deletes replicate, so every piece on them must be sent back rather than dropped.
+            var delRebuilt = new bool[delEnts.Length];
+            var delPartial = new bool[delEnts.Length];
+            for (int dI = 0; dI < delEnts.Length; dI++)
+            {
+                List<Bezier4x3> pieces = null;
+                for (int c = 0; c < createdCurves.Length; c++)
+                {
+                    if (createdPrefabs[c] != delPrefabs[dI]) continue;
+                    Bezier4x3 piece = createdCurves[c].m_Bezier;
+                    if (!SplitMatch.FollowsXZ(piece, delCurves[dI].m_Bezier)) continue;
+                    if (!SplitMatch.HeightMatches(piece, delCurves[dI].m_Bezier))
+                    {
+                        delRebuilt[dI] = true;
+                        break;
+                    }
+                    (pieces ?? (pieces = new List<Bezier4x3>())).Add(piece);
+                }
+                if (!delRebuilt[dI] && pieces != null)
+                    delPartial[dI] = !SplitMatch.CoverWholeSpan(pieces, delCurves[dI].m_Bezier);
+            }
+
+            // Per-edge commands emitted because no native operation covered this apply. Each one is
+            // replayed as its own serialized batch with both endpoints re-derived geometrically, so
+            // the receiver rebuilds the shape segment by segment instead of in one pass. Counted so a
+            // degraded replay is visible in the flight log rather than being inferred from symptoms.
+            int stubs = 0;
+            try
+            {
+                for (int i = 0; i < entities.Length; i++)
+                {
+                    Entity entity = entities[i];
+                    Entity prefab = createdPrefabs[i];
+                    string name = _prefabSystem.GetPrefabName(prefab);
+                    if (string.IsNullOrEmpty(name)) continue;
+
+                    // Safety net: never sync the game's auto-generated hidden lanes/paths;
+                    // they are recreated locally when the visible road is rebuilt.
+                    if (name.StartsWith("Invisible"))
+                    {
+                        continue;
+                    }
+
+                    Bezier4x3 b = createdCurves[i].m_Bezier;
+
+                    // A piece on a purely-split span is a local side effect (dropped); a piece on a
+                    // span whose delete is replicated rides one frame behind that delete.
+                    bool onDeletedSpan = false, onKeptSpan = false;
+                    for (int dI = 0; dI < delCurves.Length; dI++)
+                    {
+                        if (delPrefabs[dI] != prefab) continue;
+                        if (!SplitMatch.FollowsXZ(b, delCurves[dI].m_Bezier)) continue;
+                        onDeletedSpan = true;
+                        if (delRebuilt[dI] || delPartial[dI]) { onKeptSpan = true; break; }
+                    }
+                    if (onDeletedSpan && !onKeptSpan)
+                    {
+                        _capFilteredHalves++;
+                        continue;
+                    }
+
+                    if (_guard.Consume(ReplicationGuard.Key(name, b.a), now))
+                    {
+                        continue;
+                    }
+
+                    Curve curve = createdCurves[i];
+                    // The committed end nodes carry the elevation this span was built at. Without it
+                    // the receiver commits a ground net and the generator pulls the curve end down to
+                    // the terrain — over water that is the lakebed, and the span becomes a dive.
+                    float2 startElevation, endElevation;
+                    CommittedEndElevations(entity, out startElevation, out endElevation);
+                    var command = new NetPlacementCommand
+                    {
+                        PrefabName = name,
+                        Ax = b.a.x, Ay = b.a.y, Az = b.a.z,
+                        Bx = b.b.x, By = b.b.y, Bz = b.b.z,
+                        Cx = b.c.x, Cy = b.c.y, Cz = b.c.z,
+                        Dx = b.d.x, Dy = b.d.y, Dz = b.d.z,
+                        Length = curve.m_Length,
+                        Start = { ElevationLeft = startElevation.x, ElevationRight = startElevation.y },
+                        End = { ElevationLeft = endElevation.x, ElevationRight = endElevation.y },
+                        // Over water the receiver would rebuild the deck from ITS water field; pin
+                        // the span to the two committed end-node heights instead.
+                        PinProfile = ShouldPinCommittedEdge(prefab, b, startElevation,
+                            endElevation),
+                    };
+                    if (command.PinProfile) _capPinnedSpans++;
+                    if (onKeptSpan)
+                    {
+                        _deferredSpanPieces.Add(command);
+                        RecordDiagnostic(name);
+                        stubs++;
+                        continue;
+                    }
+                    session.SendCommand(0, NetPlacementCommand.Id, command.Encode());
+                    RecordDiagnostic(name);
+                    stubs++;
+                }
+            }
+            finally
+            {
+                entities.Dispose();
+                createdCurves.Dispose();
+                createdPrefabs.Dispose();
+                delEnts.Dispose();
+                delCurves.Dispose();
+                delPrefabs.Dispose();
+            }
+
+            if (stubs > 0)
+                SyncLog.Trace(LogTopic.Nets, "net per-edge fallback sent=" + stubs +
+                    " (no native operation covered this apply)");
+        }
+
+        /// <summary>
+        /// The <see cref="global::Game.Net.Elevation"/> of a committed edge's two end nodes. A node
+        /// without the component sits on the ground and is elevation 0 - the game's own convention,
+        /// and the value a course endpoint must carry to reproduce this span.
+        /// </summary>
+        private void CommittedEndElevations(Entity edge, out float2 start, out float2 end)
+        {
+            start = default;
+            end = default;
+            if (!EntityManager.HasComponent<Edge>(edge)) return;
+            Edge ends = EntityManager.GetComponentData<Edge>(edge);
+            start = NodeElevation(ends.m_Start);
+            end = NodeElevation(ends.m_End);
+        }
+
+        private float2 NodeElevation(Entity node)
+        {
+            return node != Entity.Null && EntityManager.Exists(node) &&
+                   EntityManager.HasComponent<global::Game.Net.Elevation>(node)
+                ? EntityManager.GetComponentData<global::Game.Net.Elevation>(node).m_Elevation
+                : default;
+        }
+    }
+}

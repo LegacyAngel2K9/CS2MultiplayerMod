@@ -1,0 +1,17 @@
+# Shared allowlist: never export or summarize arbitrary diagnostic reason text.
+@('route-identity-ambiguous', 'route-not-materialized', 'route-number-conflict',
+    'route-identity-and-metadata-finalized', 'route-update-graph-committed',
+    'route-update-snapshot-unavailable', 'route-update-state-mismatch', 'route-commit-lost',
+    'route-replay-unavailable', 'route-dependency-expired', 'route-already-absent',
+    'route-decode-or-apply-exception', 'existing-route-metadata-applied', 'route-metadata-applied',
+    'native-net-commit-lost', 'coalesced-operation-completed', 'coalesced-operation-rejected',
+    'coalesced-correlation-unavailable', 'coalesced-route-metadata-mismatch',
+    'move-dependency-expired', 'move-dependency-or-commit-busy', 'move-malformed',
+    'move-existing-destination-unverified', 'move-attachment-unknown', 'move-commit-lost',
+    'move-generation-failed', 'move-generator-unavailable', 'move-definition-submitted',
+    'move-definition-failed', 'move-root-verified', 'move-commit-state-unverified',
+    'upgrade-dependency-expired', 'upgrade-malformed', 'upgrade-retry-capacity',
+    'upgrade-dependency-or-commit-busy', 'upgrade-prefab-unavailable', 'upgrade-prefab-invalid',
+    'upgrade-existing-unverified', 'upgrade-generation-failed', 'upgrade-definition-submitted',
+    'upgrade-fallback-exception', 'upgrade-root-verified', 'upgrade-commit-state-unverified',
+    'upgrade-verification-capacity')

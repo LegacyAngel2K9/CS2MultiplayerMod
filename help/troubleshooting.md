@@ -135,7 +135,7 @@ If the button is still missing after a restart, continue below.
 
 ### The Multiplayer button is missing at every launch
 
-Go to options. Check that CS2MultiplayerMod appears in settings. If not:
+Go to options. Check that CS2MPMod appears in settings. If not:
 
 Remove the mod on PDXMods. Restart the game. Reinstall the mod on PDXMods. Restart the game.
 

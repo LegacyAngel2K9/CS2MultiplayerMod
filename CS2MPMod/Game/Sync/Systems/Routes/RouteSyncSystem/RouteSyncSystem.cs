@@ -1,0 +1,501 @@
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using Game;
+using Game.Common;
+using Game.Prefabs;
+using Game.Routes;
+using Game.Tools;
+using Unity.Entities;
+using Unity.Mathematics;
+using CS2MPMod.Core.Diagnostics;
+using CS2MPMod.Core.Protocol.Messages;
+using CS2MPMod.Core.Session;
+using CS2MPMod.Game.Diagnostics;
+using CS2MPMod.Game.Sync.Infrastructure;
+using CS2MPMod.Game.Sync.Commands;
+using CS2MPMod.Game.Sync.Systems.Net;
+
+namespace CS2MPMod.Game.Sync.Systems
+{
+    /// <summary>
+    /// Replicates a route and its owned waypoint/segment graph. Route numbers provide the primary
+    /// portable identity; connected transport stops are resolved from prefab, transform, and owner.
+    /// </summary>
+    public partial class RouteSyncSystem : GameSystemBase
+    {
+        private const long EditScanIntervalMs = 1000;
+        // A stop a line depends on is often still being realized from its own command. Waiting is
+        // free; giving up costs a full world transfer, so the window is generous.
+        private const long RetryWindowMs = 30000;
+        private const long InitialRetryDelayMs = 100;
+        private const long MaximumRetryDelayMs = 1000;
+        private const int MaxPendingCommands = 128;
+        private const int MaxCommandsPerFrame = 16;
+
+        private readonly ConcurrentQueue<SimulationCommandMessage> _incoming =
+            new ConcurrentQueue<SimulationCommandMessage>();
+        private readonly ReplicationGuard _guard = new ReplicationGuard();
+        private Dictionary<Entity, RouteSnapshot> _knownRoutes = new Dictionary<Entity, RouteSnapshot>();
+        private Dictionary<Entity, RouteSnapshot> _nextRoutes = new Dictionary<Entity, RouteSnapshot>();
+        private readonly HashSet<Entity> _needsCreateCapture = new HashSet<Entity>();
+        private readonly HashSet<Entity> _baselinePendingRoutes = new HashSet<Entity>();
+        private readonly HashSet<Entity> _mutatedRoutesThisFrame = new HashSet<Entity>();
+        private readonly List<PendingRouteCommand> _pendingCommands = new List<PendingRouteCommand>();
+        private readonly List<PendingCreateMetadata> _pendingCreateMetadata =
+            new List<PendingCreateMetadata>();
+        private readonly Dictionary<Entity, string> _prefabNames = new Dictionary<Entity, string>();
+        private PendingUpdateCommit _pendingUpdateCommit;
+        private string _lastRealizeFailure;
+        private long _lastEditScanMs;
+        private bool _wasGameplaySyncReady;
+
+        private struct RouteSnapshot
+        {
+            public RouteWaypointIntent[] Waypoints;
+            public uint Rgba;
+            public int RouteNumber;
+            public bool IsComplete;
+        }
+
+        private sealed class PendingRouteCommand
+        {
+            public SimulationCommandMessage Trace;
+            public RouteCreateCommand Create;
+            public RouteUpdateCommand Update;
+            public RouteDeleteCommand Delete;
+            public int OriginPlayerId;
+            public long DeadlineMs;
+            public long NextAttemptMs;
+            public long RetryDelayMs;
+            public string LastFailure;
+        }
+
+        private sealed class PendingCreateMetadata
+        {
+            public SimulationCommandMessage Trace;
+            public Entity Prefab;
+            public string PrefabName;
+            public RouteWaypointIntent[] Waypoints;
+            public HashSet<Entity> PreexistingShapeMatches;
+            public int RouteNumber;
+            public uint Rgba;
+            public long DeadlineMs;
+            public RouteCreateCommand Source;
+            public int OriginPlayerId;
+            public bool GraphCommitted;
+        }
+
+        private sealed class PendingUpdateCommit
+        {
+            public SimulationCommandMessage Trace;
+            public Entity Route;
+            public RouteUpdateCommand Source;
+            public int OriginPlayerId;
+            public long DeadlineMs;
+            public RouteSnapshot Original;
+            public RouteSnapshot Desired;
+        }
+
+        private enum RealizeResult : byte
+        {
+            Applied,
+            Retry,
+            Rejected,
+        }
+
+        private PrefabSystem _prefabSystem;
+        private PrefabIndex _prefabIndex;
+        private EntityQuery _createdRoutes;
+        private EntityQuery _deletedRoutes;
+        private EntityQuery _liveRoutes;
+        private EntityQuery _transportStops;
+        private CommandObserver _observer;
+        private NetSyncSystem _netSync;
+
+        protected override void OnCreate()
+        {
+            base.OnCreate();
+
+            _prefabSystem = World.GetOrCreateSystemManaged<PrefabSystem>();
+            _prefabIndex = new PrefabIndex(_prefabSystem,
+                GetEntityQuery(ComponentType.ReadOnly<PrefabData>()));
+            _netSync = World.GetOrCreateSystemManaged<NetSyncSystem>();
+
+            _createdRoutes = GetEntityQuery(new EntityQueryDesc
+            {
+                All = SyncQuery.ReadOnly<Created, Route, PrefabRef>(),
+                None = SyncQuery.ReadOnly<Temp, Deleted>(),
+            });
+
+            _deletedRoutes = GetEntityQuery(new EntityQueryDesc
+            {
+                All = SyncQuery.ReadOnly<Deleted, Route, PrefabRef>(),
+                None = SyncQuery.ReadOnly<Temp>(),
+            });
+
+            _liveRoutes = GetEntityQuery(new EntityQueryDesc
+            {
+                All = SyncQuery.ReadOnly<Route, PrefabRef>(),
+                None = SyncQuery.ReadOnly<Temp, Deleted>(),
+            });
+
+            _transportStops = GetEntityQuery(new EntityQueryDesc
+            {
+                All = SyncQuery.ReadOnly<global::Game.Routes.TransportStop, ConnectedRoute,
+                    PrefabRef, global::Game.Objects.Transform>(),
+                None = SyncQuery.ReadOnly<Temp, Deleted>(),
+            });
+
+            _observer = SyncObserverBinding.Bind(
+                () => new CommandObserver(_incoming, RouteCreateCommand.Id,
+                        RouteUpdateCommand.Id, RouteDeleteCommand.Id)
+                    {
+                        MaxBodyBytes = RouteCreateCommand.MaxEncodedBytes,
+                    },
+                DrainQueue);
+        }
+
+        protected override void OnDestroy()
+        {
+            SyncObserverBinding.Unbind(_observer, DrainQueue);
+            base.OnDestroy();
+        }
+
+        protected override void OnUpdate()
+        {
+            using (Diagnostics.SyncProfiler.Measure("RouteSync"))
+            {
+                MultiplayerService service = Mod.Service;
+                if (service == null) return;
+
+                MultiplayerSession session = service.Session;
+                if (!service.GameplaySyncReady)
+                {
+                    _wasGameplaySyncReady = false;
+                    if (_knownRoutes.Count > 0) _knownRoutes.Clear();
+                    if (_nextRoutes.Count > 0) _nextRoutes.Clear();
+                    if (_needsCreateCapture.Count > 0) _needsCreateCapture.Clear();
+                    if (_baselinePendingRoutes.Count > 0) _baselinePendingRoutes.Clear();
+                    return;
+                }
+
+                long now = service.NowMs;
+                _guard.Prune(now);
+                if (!_wasGameplaySyncReady)
+                {
+                    _wasGameplaySyncReady = true;
+                    BaselineLiveRoutes();
+                    return;
+                }
+                CaptureCreated(session, now);
+                CaptureDeleted(session, now);
+                ScanForEdits(session, now);
+            }
+        }
+
+        /// <summary>
+        /// Finish identities for already committed route graphs even while a later network
+        /// transaction is backlogged. This never creates tool definitions.
+        /// </summary>
+        public void FinalizePending()
+        {
+            MultiplayerService service = Mod.Service;
+            if (service == null) return;
+            if (!service.GameplaySyncReady) { ExtendCreateMetadataWindows(service.NowMs); return; }
+
+            // This pass is not gated, but what it waits for is a route the game builds from a
+            // definition that RealizePending submits - and RealizePending IS gated. Counting the
+            // window down through that hold expires it against a line that could not yet exist,
+            // and the expiry asks for a world reload.
+            ExtendCreateMetadataWindows(service.NowMs);
+
+            _mutatedRoutesThisFrame.Clear();
+            FinalizeCreatedRoutes(service.NowMs);
+        }
+
+        private readonly Infrastructure.HeldTime _createMetadataHold = new Infrastructure.HeldTime();
+
+        private void ExtendCreateMetadataWindows(long nowMs)
+        {
+            long heldMs = _createMetadataHold.Observe(nowMs,
+                Infrastructure.RealizeGate.WorldBuildingHeld ||
+                _netSync == null || !_netSync.CanBuildDefinitions);
+            if (heldMs <= 0) return;
+            for (int i = 0; i < _pendingCreateMetadata.Count; i++)
+                _pendingCreateMetadata[i].DeadlineMs += heldMs;
+        }
+
+        /// <summary>Called by <see cref="SyncRealizeSystem"/> during ToolUpdate.</summary>
+        /// <summary>
+        /// Called by <see cref="SyncRealizeSystem"/> on frames this system is not allowed to run -
+        /// terrain is catching up, or the net pipeline still has placements queued.
+        ///
+        /// A route's retry window is for waiting on its own stop, line or road to arrive, not for
+        /// waiting on permission to look. Measured against the wall it expired while this system
+        /// was gated off, and the expiry then reported a dependency that "did not resolve" and
+        /// asked for a world reload - for a command it had never once attempted. A stalled net
+        /// placement holds this gate for its whole retry window, so that was not a rare race.
+        /// </summary>
+        public void NotifyRealizeHeld(long nowMs)
+        {
+            ExtendPendingRouteWindows(nowMs);
+        }
+
+        /// <summary>When this system last got to attempt its pending commands.</summary>
+        private long _lastRouteRealizeMs;
+
+        private void ExtendPendingRouteWindows(long nowMs)
+        {
+            long heldMs = _lastRouteRealizeMs == 0 ? 0 : nowMs - _lastRouteRealizeMs;
+            _lastRouteRealizeMs = nowMs;
+            if (heldMs <= 0) return;
+            for (int i = 0; i < _pendingCommands.Count; i++)
+            {
+                _pendingCommands[i].DeadlineMs += heldMs;
+                _pendingCommands[i].NextAttemptMs += heldMs;
+            }
+        }
+
+        public void RealizePending()
+        {
+            MultiplayerService service = Mod.Service;
+            if (service == null) return;
+
+            MultiplayerSession session = service.Session;
+            if (!service.GameplaySyncReady) { ExtendPendingRouteWindows(service.NowMs); return; }
+
+            long now = service.NowMs;
+            if (_netSync == null || !_netSync.CanBuildDefinitions)
+            {
+                ExtendPendingRouteWindows(now);
+                return;
+            }
+            _lastRouteRealizeMs = now;
+
+            int budget = MaxCommandsPerFrame;
+            int retries = System.Math.Min(_pendingCommands.Count, MaxCommandsPerFrame / 2);
+            for (int i = 0; i < retries; i++)
+            {
+                // Round-robin prevents one unavailable station from monopolizing the retry budget
+                // and guarantees that fresh route commands continue to drain every frame.
+                PendingRouteCommand pending = _pendingCommands[0];
+                _pendingCommands.RemoveAt(0);
+                if (now >= pending.DeadlineMs)
+                {
+                    ExpirePending(pending);
+                    continue;
+                }
+                if (now < pending.NextAttemptMs)
+                {
+                    _pendingCommands.Add(pending);
+                    continue;
+                }
+
+                RealizeResult result = TryRealize(pending, now);
+                budget--;
+                if (result == RealizeResult.Retry) QueueRetry(pending, now);
+            }
+
+            SimulationCommandMessage message;
+            while (budget > 0 && _incoming.TryDequeue(out message))
+            {
+                if (message.OriginPlayerId == session.LocalPlayerId) continue;
+                budget--;
+                try
+                {
+                    PendingRouteCommand pending;
+                    if (message.CommandId == RouteCreateCommand.Id)
+                        pending = new PendingRouteCommand
+                        {
+                            Create = RouteCreateCommand.Decode(message.Body),
+                            OriginPlayerId = message.OriginPlayerId,
+                            DeadlineMs = now + RetryWindowMs,
+                        };
+                    else if (message.CommandId == RouteUpdateCommand.Id)
+                        pending = new PendingRouteCommand
+                        {
+                            Update = RouteUpdateCommand.Decode(message.Body),
+                            OriginPlayerId = message.OriginPlayerId,
+                            DeadlineMs = now + RetryWindowMs,
+                        };
+                    else if (message.CommandId == RouteDeleteCommand.Id)
+                        pending = new PendingRouteCommand
+                        {
+                            Delete = RouteDeleteCommand.Decode(message.Body),
+                            OriginPlayerId = message.OriginPlayerId,
+                            DeadlineMs = now + RetryWindowMs,
+                        };
+                    else
+                        continue;
+
+                    // Diagnostics retain identity, not another copy of the potentially large body.
+                    pending.Trace = new SimulationCommandMessage(message.OriginPlayerId,
+                        message.Tick, message.Sequence, message.CommandId, System.Array.Empty<byte>(), message.Epoch);
+                    if (TryRealize(pending, now) == RealizeResult.Retry)
+                        QueueRetry(pending, now);
+                }
+                catch (System.Exception ex)
+                {
+                    OperationTrace.Observe(message, "rejected", reason: "route-decode-or-apply-exception");
+                    SyncInbox.RequestResync(CS2MPMod.Game.Diagnostics.ResyncReport
+                        .Create("malformed route command rejected", "route",
+                            CS2MPMod.Game.Diagnostics.ResyncEvidence.StreamLoss)
+                        .About("malformed route command")
+                        .Tried("nothing - the command could not be decoded"));
+                    SyncLog.Warn(LogTopic.Routes, "RouteSync: dropping malformed command: " +
+                        ex.Message);
+                }
+            }
+        }
+
+        private RealizeResult TryRealize(PendingRouteCommand pending, long now)
+        {
+            if (_netSync == null || !_netSync.CanBuildDefinitions)
+                return RealizeResult.Retry;
+
+            OperationTrace.Observe(pending.Trace, "applying", prefab:
+                pending.Create != null ? pending.Create.PrefabName :
+                pending.Update != null ? pending.Update.PrefabName : pending.Delete?.PrefabName);
+
+            _lastRealizeFailure = null;
+            RealizeResult result;
+            if (pending.Create != null)
+                result = RealizeCreate(pending.Create, pending.OriginPlayerId, now, pending.Trace);
+            else if (pending.Update != null)
+                result = RealizeUpdate(pending.Update, pending.OriginPlayerId, now, pending.Trace);
+            else
+                result = pending.Delete != null
+                    ? RealizeDelete(pending.Delete, now)
+                    : RealizeResult.Rejected;
+
+            OperationTrace.Observe(pending.Trace, result == RealizeResult.Retry ? "retry" :
+                result == RealizeResult.Rejected ? "rejected" :
+                pending.Delete != null ? "completed" : "submitted", reason: _lastRealizeFailure);
+
+            // Every unmet dependency looks the same from outside: the command simply keeps
+            // retrying. Recording why the last attempt gave up makes an expired command
+            // attributable from the log instead of only visible as a missing line.
+            if (_lastRealizeFailure == null) return result;
+            if (pending.LastFailure == null)
+                SyncLog.Trace(LogTopic.Routes, "route dependency unresolved: " +
+                    _lastRealizeFailure);
+            pending.LastFailure = _lastRealizeFailure;
+            return result;
+        }
+
+        private void QueueRetry(PendingRouteCommand pending, long now)
+        {
+            if (_pendingCommands.Count < MaxPendingCommands)
+            {
+                pending.RetryDelayMs = pending.RetryDelayMs == 0
+                    ? InitialRetryDelayMs
+                    : System.Math.Min(pending.RetryDelayMs * 2,
+                        MaximumRetryDelayMs);
+                pending.NextAttemptMs = now + pending.RetryDelayMs;
+                _pendingCommands.Add(pending);
+                return;
+            }
+
+            _pendingCommands.Clear();
+            SyncInbox.RequestResync(CS2MPMod.Game.Diagnostics.ResyncReport
+                .Create("route retry queue overflow", "route",
+                    CS2MPMod.Game.Diagnostics.ResyncEvidence.StreamLoss)
+                .About("route retry queue")
+                .Tried("nothing - the retry queue was full and was cleared"));
+            SyncLog.Warn(LogTopic.Routes,
+                "RouteSync retry queue overflowed; cleared it and requested a fresh world sync.");
+        }
+
+        private void ExpirePending(PendingRouteCommand pending)
+        {
+            string operation = pending.Create != null ? "creation" :
+                pending.Update != null ? "update" : "deletion";
+            string prefabName = pending.Create != null ? pending.Create.PrefabName :
+                pending.Update != null ? pending.Update.PrefabName : pending.Delete.PrefabName;
+
+            // An unmatched delete is idempotent only when the line really is absent. Ambiguous
+            // candidates or a still-live target mean we deliberately declined a destructive guess.
+            bool needsRecovery = pending.Delete == null ||
+                                 DeleteStillNeedsRecovery(pending.Delete);
+            OperationTrace.Observe(pending.Trace, needsRecovery ? "rejected" : "completed",
+                reason: needsRecovery ? "route-dependency-expired" : "route-already-absent");
+            if (needsRecovery)
+                SyncInbox.RequestResync(CS2MPMod.Game.Diagnostics.ResyncReport
+                    .Create("route " + operation + " dependency did not resolve", "route",
+                        CS2MPMod.Game.Diagnostics.ResyncEvidence.MissingTarget)
+                    .About(operation + " of '" + prefabName + "'")
+                    .Tried("retried with backoff for 30 s of attempts, not counting time this system was held back")
+                    .Fact("last failure", pending.LastFailure));
+            SyncLog.Warn(LogTopic.Routes, "RouteSync " + operation + " for '" + prefabName +
+                "' did not resolve within " + (RetryWindowMs / 1000) + " s" +
+                (pending.LastFailure != null ? " (" + pending.LastFailure + ")" : string.Empty) +
+                (needsRecovery ? "; requested a fresh world sync." : "; line is already absent."));
+        }
+
+        private void DrainQueue()
+        {
+            SyncInbox.Clear(_incoming);
+            _lastRouteRealizeMs = 0;
+            _pendingCommands.Clear();
+            _pendingCreateMetadata.Clear();
+            _pendingUpdateCommit = null;
+            _needsCreateCapture.Clear();
+            _baselinePendingRoutes.Clear();
+            _mutatedRoutesThisFrame.Clear();
+            _knownRoutes.Clear();
+            _nextRoutes.Clear();
+            _prefabNames.Clear();
+            _guard.Clear();
+            _lastRealizeFailure = null;
+            _lastEditScanMs = 0;
+            _wasGameplaySyncReady = false;
+        }
+
+        /// <summary>Stops served plus the waypoints that only shape the path between them.</summary>
+        private static string DescribeShape(RouteWaypointIntent[] waypoints)
+        {
+            int stops = 0;
+            for (int i = 0; i < waypoints.Length; i++)
+                if (!string.IsNullOrEmpty(waypoints[i].StopPrefabName)) stops++;
+            return stops + " stop(s)" + (waypoints.Length != stops
+                ? " + " + (waypoints.Length - stops) + " path waypoint(s)"
+                : string.Empty);
+        }
+
+        private static string RouteKey(string prefix, string prefabName, int routeNumber,
+            float3 firstWaypoint) =>
+            prefix + "|" + routeNumber + "|" + ReplicationGuard.Key(prefabName, firstWaypoint);
+
+        private static string RouteShapeKey(string prefix, string prefabName,
+            RouteWaypointIntent[] waypoints)
+        {
+            unchecked
+            {
+                uint hash = 2166136261u;
+                for (int i = 0; i < waypoints.Length; i++)
+                {
+                    HashCoordinate(ref hash, waypoints[i].X);
+                    HashCoordinate(ref hash, waypoints[i].Y);
+                    HashCoordinate(ref hash, waypoints[i].Z);
+                    HashString(ref hash, waypoints[i].StopPrefabName);
+                    HashString(ref hash, waypoints[i].OwnerPrefabName);
+                }
+                return prefix + "|" + prefabName + "|" + waypoints.Length + "|" + hash;
+            }
+        }
+
+        private static void HashCoordinate(ref uint hash, float value)
+        {
+            hash = (hash ^ (uint)(int)math.round(value * 10f)) * 16777619u;
+        }
+
+        private static void HashString(ref uint hash, string value)
+        {
+            if (value != null)
+                for (int i = 0; i < value.Length; i++)
+                    hash = (hash ^ value[i]) * 16777619u;
+            // Field delimiter keeps ["ab", "c"] distinct from ["a", "bc"].
+            hash = (hash ^ 0xffu) * 16777619u;
+        }
+    }
+}

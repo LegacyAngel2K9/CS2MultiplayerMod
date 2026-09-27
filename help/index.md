@@ -51,5 +51,5 @@ services, finances, progression, time and weather stay in sync while you build t
 | --- | --- |
 | Discord | [Development server](https://discord.gg/KFZTW2YSJt) — support, playtests and news |
 | Paradox Mods | [Download the mod](https://mods.paradoxplaza.com/mods/150432/Windows) |
-| GitHub | [Source code and issue tracker](https://github.com/Rollocraft/CS2MultiplayerMod) |
+| GitHub | [Source code and issue tracker](https://github.com/Rollocraft/CS2MPMod) |
 | What is my IP? | [api.ipify.org](https://api.ipify.org/) |

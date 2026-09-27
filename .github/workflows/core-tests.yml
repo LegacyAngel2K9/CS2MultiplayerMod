@@ -1,0 +1,78 @@
+name: Core regression checks
+
+on:
+  push:
+    paths:
+      - 'CS2MPMod/Core/**'
+      - 'CS2MPMod/UI/**'
+      - 'CS2MPMod/Game/Diagnostics/**'
+      - 'CS2MPMod/Game/Sync/**'
+      - 'tests/**'
+      - 'global.json'
+      - 'build/export-sync-diagnostics.ps1'
+      - 'build/export-frame-diagnostics.ps1'
+      - 'build/test-installed-package.ps1'
+      - 'build/diagnostic-reason-codes.ps1'
+      - 'build/summarize-sync-diagnostics.ps1'
+      - 'build/read-received-report.ps1'
+      - 'build/test-build-environment.ps1'
+      - '.github/workflows/core-tests.yml'
+  pull_request:
+    paths:
+      - 'CS2MPMod/Core/**'
+      - 'CS2MPMod/UI/**'
+      - 'CS2MPMod/Game/Diagnostics/**'
+      - 'CS2MPMod/Game/Sync/**'
+      - 'tests/**'
+      - 'global.json'
+      - 'build/export-sync-diagnostics.ps1'
+      - 'build/export-frame-diagnostics.ps1'
+      - 'build/test-installed-package.ps1'
+      - 'build/diagnostic-reason-codes.ps1'
+      - 'build/summarize-sync-diagnostics.ps1'
+      - 'build/read-received-report.ps1'
+      - 'build/test-build-environment.ps1'
+      - '.github/workflows/core-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Run game-independent regression checks
+        run: dotnet run --project tests/CS2MPMod.Core.Tests -c Release
+      - name: Check SDK preflight and private-data export
+        shell: pwsh
+        run: |
+          ./build/test-build-environment.ps1 -CoreOnly
+          ./tests/test-diagnostic-summary.ps1
+          ./tests/test-received-report.ps1
+          ./tests/test-frame-export.ps1
+          ./tests/test-installed-package.ps1
+
+  ui:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: CS2MPMod/UI/package-lock.json
+      - name: Build UI without game installation or deployment
+        working-directory: CS2MPMod/UI
+        shell: pwsh
+        env:
+          CSII_USERDATAPATH: ${{ runner.temp }}/cs2mp-ui-staging
+        run: |
+          npm ci --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build
+          exit $LASTEXITCODE
